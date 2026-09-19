@@ -930,10 +930,15 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   const [playerFrameId, setPlayerFrameId] = useState('media_player')
   // Desired publish FPS; 0 means "auto" (use the source video's measured rate).
   const [playerFps, setPlayerFps] = useState(0)
+  // Desired publish dimensions; 0 means "auto" (keep the source's natural size).
+  const [playerWidth, setPlayerWidth] = useState(0)
+  const [playerHeight, setPlayerHeight] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [topicDraft, setTopicDraft] = useState('')
   const [frameIdDraft, setFrameIdDraft] = useState('')
   const [fpsDraft, setFpsDraft] = useState('')
+  const [widthDraft, setWidthDraft] = useState('')
+  const [heightDraft, setHeightDraft] = useState('')
   // The video may not play until it has been preprocessed (normalized) on the
   // backend. While that's in flight we show a spinner and leave src empty;
   // playSrc is set to the resolved stream url once ready.
@@ -955,6 +960,10 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   frameIdRef.current = playerFrameId
   const fpsRef = useRef(playerFps)
   fpsRef.current = playerFps
+  const widthRef = useRef(playerWidth)
+  widthRef.current = playerWidth
+  const heightRef = useRef(playerHeight)
+  heightRef.current = playerHeight
   // Mirror of `processing` so the []-once key handler and other stale-closure
   // callbacks can refuse playback until the stream is preprocessed.
   const processingRef = useRef(processing)
@@ -975,6 +984,8 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
           topic,
           frame_id: frameId,
           fps,
+          width: widthRef.current,
+          height: heightRef.current,
         }),
       }).catch(() => {})
     },
@@ -1005,6 +1016,12 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         if (typeof (body as { fps?: unknown })?.fps === 'number') {
           setPlayerFps((body as { fps?: number }).fps ?? 0)
         }
+        if (typeof (body as { width?: unknown })?.width === 'number') {
+          setPlayerWidth((body as { width?: number }).width ?? 0)
+        }
+        if (typeof (body as { height?: unknown })?.height === 'number') {
+          setPlayerHeight((body as { height?: number }).height ?? 0)
+        }
       })
       .catch(() => {
         if (!alive) return
@@ -1021,10 +1038,14 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
 
   // Set the player-level ROS topic + frame id + desired FPS and persist immediately.
   const changePlayerTopic = useCallback(
-    (topic: string, frameId: string, fps: number) => {
+    (topic: string, frameId: string, fps: number, width: number, height: number) => {
+      widthRef.current = width
+      heightRef.current = height
       setPlayerTopic(topic)
       setPlayerFrameId(frameId)
       setPlayerFps(fps)
+      setPlayerWidth(width)
+      setPlayerHeight(height)
       saveTimeline(tracksRef.current ?? [], topic, frameId, fps)
     },
     [saveTimeline],
@@ -1075,16 +1096,22 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTopicDraft(playerTopic)
       setFrameIdDraft(playerFrameId)
       setFpsDraft(playerFps > 0 ? String(playerFps) : '')
+      setWidthDraft(playerWidth > 0 ? String(playerWidth) : '')
+      setHeightDraft(playerHeight > 0 ? String(playerHeight) : '')
     }
-  }, [settingsOpen, playerTopic, playerFrameId, playerFps])
+  }, [settingsOpen, playerTopic, playerFrameId, playerFps, playerWidth, playerHeight])
 
   const commitPlayerTopic = useCallback(() => {
-    // Empty / non-numeric / non-positive means "auto" (use source video rate).
+    // Empty / non-numeric / non-positive means "auto" (use source rate/size).
     const parsed = Number(fpsDraft)
     const fps = Number.isFinite(parsed) && parsed > 0 ? parsed : 0
-    changePlayerTopic(topicDraft.trim(), frameIdDraft.trim(), fps)
+    const wp = Number(widthDraft)
+    const width = Number.isFinite(wp) && wp > 0 ? Math.round(wp) : 0
+    const hp = Number(heightDraft)
+    const height = Number.isFinite(hp) && hp > 0 ? Math.round(hp) : 0
+    changePlayerTopic(topicDraft.trim(), frameIdDraft.trim(), fps, width, height)
     setSettingsOpen(false)
-  }, [changePlayerTopic, topicDraft, frameIdDraft, fpsDraft])
+  }, [changePlayerTopic, topicDraft, frameIdDraft, fpsDraft, widthDraft, heightDraft])
 
   // Send a playback control to the backend. The backend owns the decode + ROS
   // publish cursor; the browser only says "play/pause/stop/scrub at time t".
@@ -1132,8 +1159,8 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         media_id: id,
-        width: 0,
-        height: 0,
+        width: playerWidth,
+        height: playerHeight,
         fps: fpsRef.current,
       }),
     })
@@ -1153,7 +1180,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     return () => {
       alive = false
     }
-  }, [id, playerFps])
+  }, [id, playerFps, playerWidth, playerHeight])
 
   const addMarker = useCallback(
     (key: string, point: TimelinePoint) => {
@@ -1580,6 +1607,47 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
                 placeholder="auto (source rate)"
                 className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
               />
+              <label className="mt-4 block text-[13px] font-medium text-neutral-300">
+                Publish resolution
+              </label>
+              <div className="mt-1.5 grid grid-cols-2 gap-2">
+                <div>
+                  <input
+                    value={widthDraft}
+                    onChange={(e) => setWidthDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitPlayerTopic()
+                      else if (e.key === 'Escape') setSettingsOpen(false)
+                    }}
+                    inputMode="numeric"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="width"
+                    aria-label="Publish width"
+                    title="Publish width (0 / empty = source width)"
+                    className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <input
+                    value={heightDraft}
+                    onChange={(e) => setHeightDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') commitPlayerTopic()
+                      else if (e.key === 'Escape') setSettingsOpen(false)
+                    }}
+                    inputMode="numeric"
+                    type="number"
+                    min="1"
+                    step="1"
+                    placeholder="height"
+                    aria-label="Publish height"
+                    title="Publish height (0 / empty = source height)"
+                    className="w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
               <div className="mt-5 flex justify-end gap-2">
                 <button
                   onClick={() => setSettingsOpen(false)}
