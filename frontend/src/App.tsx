@@ -932,6 +932,11 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   const [topicDraft, setTopicDraft] = useState('')
   const [frameIdDraft, setFrameIdDraft] = useState('')
 
+  // Frame duration, measured live via requestVideoFrameCallback so stepping
+  // advances exactly one video frame (falls back to ~30fps before playback).
+  const frameDurRef = useRef(1 / 30)
+  const lastStepRef = useRef(0)
+
   // Mirror refs so envelope saves (which fire from callbacks with stale
   // closures) always persist the complete state, never clobber one field.
   const tracksRef = useRef<TimelineTrack[] | null>(tracks)
@@ -1053,6 +1058,35 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     changePlayerTopic(topicDraft.trim(), frameIdDraft.trim())
     setSettingsOpen(false)
   }, [changePlayerTopic, topicDraft, frameIdDraft])
+
+  // Send a playback control to the backend. The backend owns the decode + ROS
+  // publish cursor; the browser only says "play/pause/stop/scrub at time t".
+  const sendControl = useCallback((cmd: 'play' | 'pause' | 'stop' | 'scrub', t: number) => {
+    const v = videoRef.current
+    const w = v?.videoWidth ?? 0
+    const h = v?.videoHeight ?? 0
+    const fps = frameDurRef.current ? Math.round(1 / frameDurRef.current) : 30
+    fetch('/publish/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        media_id: id,
+        cmd,
+        t,
+        width: w,
+        height: h,
+        fps,
+        topic: topicRef.current,
+        frame_id: frameIdRef.current,
+      }),
+    }).catch(() => {})
+  }, [id])
+
+  // Mirror so `[]`-once effects (key handling, media events) can fire controls
+  // without capturing a stale sendControl closure.
+  const sendControlRef = useRef(sendControl)
+  sendControlRef.current = sendControl
+
   const addMarker = useCallback(
     (key: string, point: TimelinePoint) => {
       setTracks((prev) => {
@@ -1177,7 +1211,10 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       const b = v.buffered
       if (b.length) setBuffered(b.end(b.length - 1))
     }
-    const onEnded = () => setPlaying(false)
+    const onEnded = () => {
+      setPlaying(false)
+      sendControlRef.current('stop', v.currentTime)
+    }
 
     v.addEventListener('timeupdate', onTime)
     v.addEventListener('durationchange', onDur)
@@ -1200,14 +1237,20 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     if (!v || !isFinite(t)) return
     v.currentTime = t
     setCurrent(t)
-  }, [])
+    sendControl('scrub', t)
+  }, [sendControl])
 
   const toggle = useCallback(() => {
     const v = videoRef.current
     if (!v) return
-    if (v.paused) v.play().catch(() => {})
-    else v.pause()
-  }, [])
+    if (v.paused) {
+      v.play().catch(() => {})
+      sendControl('play', v.currentTime)
+    } else {
+      v.pause()
+      sendControl('pause', v.currentTime)
+    }
+  }, [sendControl])
 
   const stop = useCallback(() => {
     const v = videoRef.current
@@ -1215,12 +1258,11 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     v.pause()
     v.currentTime = 0
     setCurrent(0)
-  }, [])
+    sendControl('stop', 0)
+  }, [sendControl])
 
   // Frame duration, measured live via requestVideoFrameCallback so stepping
   // advances exactly one video frame (falls back to ~30fps before playback).
-  const frameDurRef = useRef(1 / 30)
-  const lastStepRef = useRef(0)
   useEffect(() => {
     const v = videoRef.current
     if (!v || typeof (v as HTMLVideoElement).requestVideoFrameCallback !== 'function') return
@@ -1266,8 +1308,13 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       const key = (e as KeyboardEvent).key
       if (key === ' ') {
         e.preventDefault()
-        if (v.paused) v.play().catch(() => {})
-        else v.pause()
+        if (v.paused) {
+          v.play().catch(() => {})
+          sendControlRef.current('play', v.currentTime)
+        } else {
+          v.pause()
+          sendControlRef.current('pause', v.currentTime)
+        }
       } else if (key === 'ArrowRight' || key === 'ArrowLeft') {
         e.preventDefault()
         const dir = key === 'ArrowRight' ? 1 : -1
@@ -1278,7 +1325,9 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         lastStepRef.current = now
         if (!v.paused) v.pause()
         const t = v.currentTime + dir * frameDurRef.current
-        v.currentTime = dir === 1 ? Math.min(v.duration || 0, t) : Math.max(0, t)
+        const nextT = dir === 1 ? Math.min(v.duration || 0, t) : Math.max(0, t)
+        v.currentTime = nextT
+        sendControlRef.current('scrub', nextT)
       }
     }
     window.addEventListener('keydown', onKey)

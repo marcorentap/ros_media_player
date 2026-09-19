@@ -22,10 +22,14 @@ the same database, readable via ``GET /api/timeline/<id>`` and saved with
 import json
 import mimetypes
 import os
+import shutil
 import sqlite3
+import subprocess
 import threading
+import time
 import uuid
 import urllib.parse
+from collections import deque
 from contextlib import closing
 from datetime import datetime, timezone
 from email import message_from_bytes
@@ -35,6 +39,8 @@ import rclpy
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 
+from geometry_msgs.msg import Point, PointStamped
+from sensor_msgs.msg import Image as ImageMsg
 from std_msgs.msg import String
 
 # Media types the gallery accepts for upload.
@@ -65,6 +71,13 @@ class MediaPlayerBackend:
         # QoS: reliable + transient local so the publisher can be created
         # here even if no subscriber exists yet and clicks are never dropped.
         self.pub = self.node.create_publisher(String, command_topic, 10)
+        # Lazily-created publishers for media frames (sensor_msgs/Image) and
+        # lane-track points (geometry_msgs/PointStamped or Point), keyed by
+        # topic so a configurable topic doesn't require a fixed publisher.
+        self._img_pubs: dict[str, object] = {}
+        self._stamped_pubs: dict[str, object] = {}
+        self._plain_pubs: dict[str, object] = {}
+        self._player = _Player(self)
         self.node.get_logger().info(
             f"media_player publishing commands on '{command_topic}'")
         self.node.get_logger().info(
@@ -90,6 +103,65 @@ class MediaPlayerBackend:
         finally:
             httpd.server_close()
             self.shutdown()
+
+    def _img_pub(self, topic):
+        pub = self._img_pubs.get(topic)
+        if pub is None:
+            pub = self.node.create_publisher(ImageMsg, topic, 10)
+            self._img_pubs[topic] = pub
+        return pub
+
+    def _stamped_pub(self, topic):
+        pub = self._stamped_pubs.get(topic)
+        if pub is None:
+            pub = self.node.create_publisher(PointStamped, topic, 10)
+            self._stamped_pubs[topic] = pub
+        return pub
+
+    def _plain_pub(self, topic):
+        pub = self._plain_pubs.get(topic)
+        if pub is None:
+            pub = self.node.create_publisher(Point, topic, 10)
+            self._plain_pubs[topic] = pub
+        return pub
+
+    def publish_image(self, topic: str, frame_id: str,
+                      width: int, height: int, encoding: str, data: bytes) -> None:
+        """Publish raw pixel bytes as a sensor_msgs/Image."""
+        msg = ImageMsg()
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        msg.height = int(height)
+        msg.width = int(width)
+        msg.encoding = encoding
+        msg.is_bigendian = False
+        msg.step = int(width) * (4 if encoding == "rgba8" else 3)
+        msg.data = data
+        self._img_pub(topic).publish(msg)
+        self.node.get_logger().info(
+            f"published image [{encoding} {width}x{height}] on '{topic}'")
+
+    def publish_point(self, topic: str, frame_id: str,
+                      x: float, y: float, stamped: bool) -> None:
+        """Publish a lane-track point as PointStamped (or bare Point)."""
+        now = self.node.get_clock().now().to_msg()
+        if stamped:
+            msg = PointStamped()
+            msg.header.stamp = now
+            msg.header.frame_id = frame_id
+            msg.point.x = float(x)
+            msg.point.y = float(y)
+            msg.point.z = 0.0
+            self._stamped_pub(topic).publish(msg)
+        else:
+            msg = Point()
+            msg.x = float(x)
+            msg.y = float(y)
+            msg.z = 0.0
+            self._plain_pub(topic).publish(msg)
+        self.node.get_logger().info(
+            f"published {'PointStamped' if stamped else 'Point'} ({x:.4f},{y:.4f}) "
+            f"on '{topic}'")
 
     def shutdown(self) -> None:
         self.executor.shutdown()
@@ -219,6 +291,215 @@ class MediaPlayerBackend:
                 "ON CONFLICT(media_id) DO UPDATE SET data = excluded.data",
                 (media_id, json.dumps(data)))
             conn.commit()
+
+
+class _Player:
+    """Backend-owned media cursor.
+
+    The browser never sends pixels; it only sends controls (play/pause/stop
+    at a time). This player decodes the media file inside this process and
+    publishes frames plus the lane points the cursor passes as it runs its own
+    wall-clock clock. Media bytes are fed to ffmpeg via stdin because the
+    snap-installed ffmpeg on this box cannot open dot-prefixed ~/.ros paths.
+    """
+
+    def __init__(self, backend):
+        self.b = backend
+        self._lock = threading.Lock()
+        self._proc = None
+        self._pump_thread = None
+        self._reader_thread = None
+        self._pacer_thread = None
+        self._watchdog_thread = None
+        self._frames = deque()
+        self._alive = False
+        self._playing = False
+        self._t = 0.0
+        self._media_id = None
+        self._path = None
+        self._w = 0
+        self._h = 0
+        self._fps = 30.0
+        self._topic = "/media_player/image"
+        self._frame_id = "media_player"
+        self._tracks = []
+
+    def _ffmpeg(self):
+        return shutil.which("ffmpeg") or "/snap/bin/ffmpeg"
+
+    def _stop(self):
+        with self._lock:
+            self._playing = False
+            self._alive = False
+            proc = self._proc
+            self._proc = None
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                pass
+        for t in (self._pump_thread, self._reader_thread, self._pacer_thread,
+                  self._watchdog_thread):
+            if (t is not None and t.is_alive()
+                    and t is not threading.current_thread()):
+                t.join(timeout=2)
+
+    def _decode_frame_at(self, path, t, width, height) -> bytes | None:
+        """One-shot decode of a single frame at time t into raw RGBA."""
+        with open(path, "rb") as f:
+            data = f.read()
+        try:
+            proc = subprocess.run(
+                [self._ffmpeg(), "-v", "error", "-i", "-", "-ss", str(t),
+                 "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba",
+                 "-s", f"{width}x{height}", "-"],
+                input=data, capture_output=True, timeout=30)
+        except Exception as exc:
+            self.b.node.get_logger().error(
+                f"frame decode at t={t} failed: {exc}")
+            return None
+        need = width * height * 4
+        if proc.returncode != 0 or len(proc.stdout) != need:
+            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+            lines = err.splitlines()
+            detail = "\n".join(f"  {l}" for l in lines[-3:]) if lines else ""
+            self.b.node.get_logger().error(
+                f"frame decode at t={t} got {len(proc.stdout)}/{need} bytes "
+                f"(rc={proc.returncode}){(':\n' + detail) if detail else ''}")
+            return None
+        return proc.stdout
+
+    def _points_at(self, t):
+        hits = []
+        for tr in self._tracks:
+            for p in tr.get("points") or []:
+                if abs(t - p.get("t", 0)) <= 0.05:
+                    hits.append((tr.get("topic"), tr.get("frameId"),
+                                 tr.get("stamped", True),
+                                 p.get("x", 0.5), p.get("y", 0.5)))
+        return hits
+
+    def _publish_frame(self, rgba):
+        self.b.publish_image(self._topic, self._frame_id,
+                             self._w, self._h, "rgba8", rgba)
+        for topic, fid, stamped, x, y in self._points_at(self._t):
+            self.b.publish_point(topic or self._topic, fid or self._frame_id,
+                                 x, y, stamped)
+
+    def _spawn_stream(self):
+        ffmpeg = self._ffmpeg()
+        args = [ffmpeg, "-v", "error", "-i", "-", "-ss", str(self._t),
+                "-f", "rawvideo", "-pix_fmt", "rgba",
+                "-s", f"{self._w}x{self._h}", "-"]
+        self._proc = subprocess.Popen(
+            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        self._frames.clear()
+        self._frame_bytes = self._w * self._h * 4
+        self._alive = True
+
+        def pump():
+            try:
+                with open(self._path, "rb") as f:
+                    while True:
+                        chunk = f.read(1 << 20)
+                        if not chunk:
+                            break
+                        try:
+                            self._proc.stdin.write(chunk)
+                            self._proc.stdin.flush()
+                        except (BrokenPipeError, ValueError, OSError):
+                            break
+                try:
+                    self._proc.stdin.close()
+                except OSError:
+                    pass
+            except Exception:
+                pass
+        self._pump_thread = threading.Thread(target=pump, daemon=True)
+        self._pump_thread.start()
+
+        def read_frames():
+            n = self._frame_bytes
+            while self._alive:
+                try:
+                    raw = self._proc.stdout.read(n)
+                except Exception:
+                    break
+                if not raw or len(raw) != n:
+                    break
+                with self._lock:
+                    if len(self._frames) < int(self._fps * 2):
+                        self._frames.append(raw)
+                if not self._alive:
+                    break
+            with self._lock:
+                self._alive = False
+        self._reader_thread = threading.Thread(target=read_frames, daemon=True)
+        self._reader_thread.start()
+
+        def watchdog():
+            self._reader_thread.join(timeout=int(self._fps * 2))
+            with self._lock:
+                empty = not self._frames and self._alive
+            if empty:
+                self.b.node.get_logger().error(
+                    "play stream produced no frames — check the ffmpeg "
+                    "codec / media file")
+                with self._lock:
+                    self._alive = False
+        self._watchdog_thread = threading.Thread(target=watchdog, daemon=True)
+        self._watchdog_thread.start()
+
+        def pace():
+            period = 1.0 / self._fps
+            while True:
+                time.sleep(period)
+                with self._lock:
+                    if not self._alive or not self._playing:
+                        return
+                    self._t += period
+                    rgba = (self._frames.popleft() if self._frames else None)
+                if rgba is not None:
+                    self._publish_frame(rgba)
+        self._pacer_thread = threading.Thread(target=pace, daemon=True)
+        self._pacer_thread.start()
+
+    def play(self, media_id, path, t, width, height, fps,
+             topic, frame_id, tracks):
+        self._stop()
+        with self._lock:
+            self._media_id = media_id
+            self._path = path
+            self._t = max(0.0, float(t))
+            self._w = int(width)
+            self._h = int(height)
+            self._fps = max(1.0, float(fps))
+            self._topic = topic
+            self._frame_id = frame_id
+            self._tracks = tracks
+        self._spawn_stream()
+        with self._lock:
+            self._playing = True
+
+    def set_frame(self, t, width, height):
+        """Paused update: set the cursor and publish the single frame at t."""
+        self._stop()
+        with self._lock:
+            self._t = max(0.0, float(t))
+            if width:
+                self._w = int(width)
+            if height:
+                self._h = int(height)
+        rgba = None
+        if self._path:
+            rgba = self._decode_frame_at(self._path, self._t, self._w, self._h)
+        if rgba:
+            self._publish_frame(rgba)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -428,12 +709,98 @@ class _Handler(BaseHTTPRequestHandler):
                         "x": float(x) if isinstance(x, (int, float)) else 0.5,
                         "y": float(y) if isinstance(y, (int, float)) else 0.5,
                     })
-            clean.append({"key": key, "name": name, "color": color, "points": points})
-        self.backend.save_timeline(media_id, {"tracks": clean})
+            clean.append({
+                "key": key,
+                "name": name,
+                "color": color,
+                # Persist per-track publish settings too: the frontend edits
+                # topic/frameId/stamped in the track settings dialog, and
+                # _points_at/_publish_frame read them back for publishing.
+                "topic": (t.get("topic") or "").strip() if isinstance(t.get("topic"), str) else "",
+                "frameId": (t.get("frameId") or "").strip() if isinstance(t.get("frameId"), str) else "",
+                "stamped": bool(t.get("stamped", True)),
+                "points": points,
+            })
+        out = {"tracks": clean}
+        if isinstance(payload.get("topic"), str):
+            out["topic"] = payload["topic"].strip()
+        if isinstance(payload.get("frame_id"), str):
+            out["frame_id"] = payload["frame_id"].strip()
+        self.backend.save_timeline(media_id, out)
         self.backend.node.get_logger().info(
             f"saved timeline for '{media_id}' ({len(clean)} tracks, "
             f"{sum(len(c['points']) for c in clean)} markers)")
         self._respond(200, {"ok": True})
+
+    def _handle_control(self) -> None:
+        """Accept a playback control from the browser and drive the backend
+        cursor. The browser never sends pixels — only commands.
+
+        Body (JSON):
+          { media_id, cmd ("play"|"pause"|"stop"|"scrub"),
+            t, width, height, fps, topic, frame_id }
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._respond(400, {"error": "bad content-length"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self._respond(400, {"error": "expected JSON body"})
+            return
+        if not isinstance(payload, dict):
+            self._respond(400, {"error": "expected JSON object"})
+            return
+        media_id = payload.get("media_id")
+        cmd = payload.get("cmd")
+        if not media_id or not cmd:
+            self._respond(400, {"error": "'media_id' and 'cmd' required"})
+            return
+        rec = self.backend.get_media(media_id)
+        if rec is None:
+            self._respond(404, {"error": "media not found"})
+            return
+        path = os.path.join(self.backend.media_dir, media_id)
+        if not os.path.isfile(path):
+            self._respond(404, {"error": "media file missing"})
+            return
+        try:
+            t = float(payload.get("t", 0))
+        except (TypeError, ValueError):
+            t = 0.0
+        width = int(payload.get("width") or 0)
+        height = int(payload.get("height") or 0)
+        try:
+            fps = float(payload.get("fps"))
+        except (TypeError, ValueError):
+            fps = 30.0
+        topic = payload.get("topic") or "/media_player/image"
+        frame_id = payload.get("frame_id") or "media_player"
+
+        timeline = self.backend.get_timeline(media_id) or {}
+        tracks = timeline.get("tracks", [])
+        if not isinstance(tracks, list):
+            tracks = []
+        player = self.backend._player
+
+        self.backend.node.get_logger().info(
+            f"control cmd={cmd} media_id={media_id!r} t={t:.3f} "
+            f"fps={fps} target={width if width else 'natural'}x"
+            f"{height if height else 'natural'} topic={topic!r} "
+            f"frame_id={frame_id!r} tracks={len(tracks)}")
+
+        if cmd == "play":
+            player.play(media_id, path, t, width, height, fps,
+                        topic, frame_id, tracks)
+            self._respond(200, {"ok": True, "cmd": "play", "t": t})
+            return
+        if cmd in ("pause", "stop", "scrub"):
+            player.set_frame(t, width, height)
+            self._respond(200, {"ok": True, "cmd": cmd, "t": t})
+            return
+        self._respond(400, {"error": f"unknown cmd: {cmd}"})
 
     # --- routes ------------------------------------------------------------
 
@@ -505,6 +872,10 @@ class _Handler(BaseHTTPRequestHandler):
         if route.startswith("/api/timeline/"):
             mid = urllib.parse.unquote(route[len("/api/timeline/"):])
             self._handle_timeline_post(mid)
+            return
+
+        if route == "/publish/control":
+            self._handle_control()
             return
 
         if route != "/publish":
