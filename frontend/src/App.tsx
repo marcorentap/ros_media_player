@@ -1110,6 +1110,10 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   // inflated the live frameDur measurement and made later steps jump seconds.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      // Don't hijack keys while the user is typing in an input/text field
+      // (the rename dialog is portaled to body, so it bubbles up here).
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
       const v = videoRef.current
       if (!v) return
       const key = (e as KeyboardEvent).key
