@@ -23,6 +23,7 @@ import json
 import mimetypes
 import os
 import shutil
+import math
 import sqlite3
 import subprocess
 import threading
@@ -828,7 +829,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(404, {"error": "not found"})
             return
         data = self.backend.get_timeline(media_id) or {}
-        self._respond(200, {"media": media_id, "tracks": data.get("tracks", [])})
+        # Return the full envelope so the frontend can restore topic, frame_id,
+        # fps, width, and height settings on reload, not just the tracks.
+        self._respond(200, {
+            "media": media_id,
+            "tracks": data.get("tracks", []),
+            "topic": data.get("topic", ""),
+            "frame_id": data.get("frame_id", ""),
+            "fps": data.get("fps") or 0,
+            "width": data.get("width") or 0,
+            "height": data.get("height") or 0,
+        })
 
     def _handle_timeline_post(self, media_id: str) -> None:
         rec = self.backend.get_media(media_id)
@@ -888,27 +899,34 @@ class _Handler(BaseHTTPRequestHandler):
                 "stamped": bool(t.get("stamped", True)),
                 "points": points,
             })
-        out = {"tracks": clean}
+        # Merge onto any previously stored envelope so a POST that omits fields
+        # (e.g. only tracks) doesn't wipe earlier settings; tracks always refresh.
+        old = self.backend.get_timeline(media_id) or {}
+        out = dict(old)
+        out["tracks"] = clean
         if isinstance(payload.get("topic"), str):
             out["topic"] = payload["topic"].strip()
         if isinstance(payload.get("frame_id"), str):
             out["frame_id"] = payload["frame_id"].strip()
-        if isinstance(payload.get("fps"), (int, float)):
-            fps = float(payload["fps"])
-            out["fps"] = fps if (fps > 0 and fps == fps) else 0
-        # Persist the desired publish resolution too (0 = keep source size).
-        if isinstance(payload.get("width"), (int, float)):
-            w = int(payload["width"])
-            out["width"] = w if w > 0 else 0
-        if isinstance(payload.get("height"), (int, float)):
-            h = int(payload["height"])
-            out["height"] = h if h > 0 else 0
+        # fps/width/height sanitized (reject bools and NaN/inf) so the envelope
+        # never stores junk; 0 means "keep source size / native rate".
+        fps = payload.get("fps")
+        if isinstance(fps, (int, float)) and not isinstance(fps, bool):
+            f = float(fps)
+            out["fps"] = f if (f > 0 and math.isfinite(f)) else 0
+        for key in ("width", "height"):
+            v = payload.get(key)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                try:
+                    n = int(v)
+                except (TypeError, ValueError, OverflowError):
+                    n = 0
+                out[key] = n if (n > 0 and math.isfinite(float(v))) else 0
 
         # Capture the previously-stored markers BEFORE saving, so we can detect
         # and publish any newly-added point on the spot. This makes a marker
         # dropped by clicking the video publish immediately, not only when the
         # cursor later crosses its timestamp during playback/scrubbing.
-        old = self.backend.get_timeline(media_id) or {}
         old_marks = set()
 
         for tr in (old.get("tracks") or []) if isinstance(old.get("tracks"), list) else []:
