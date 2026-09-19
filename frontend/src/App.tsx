@@ -1,21 +1,28 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from 'react'
+import { createPortal } from 'react-dom'
 import {
   ArrowLeft,
+  Minus,
   Pause,
   Pencil,
   Play,
+  Plus,
   Repeat,
+  Settings2,
   Square,
   StepBack,
   StepForward,
   Upload,
+  X,
 } from 'lucide-react'
 
 type MediaItem = {
@@ -257,70 +264,597 @@ function formatTime(t: number): string {
     .padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
 }
 
-type ScrubberProps = {
-  current: number
-  duration: number
-  buffered: number
-  onSeek: (t: number) => void
+// A marker pinned to a moment of playback. t is seconds; x,y are the click
+// position normalized to the video element box (0..1) so the same dot can be
+// drawn back on top of the video when the playhead passes t.
+type TimelinePoint = {
+  t: number
+  x: number
+  y: number
 }
 
-function Scrubber({ current, duration, buffered, onSeek }: ScrubberProps) {
-  const trackRef = useRef<HTMLDivElement>(null)
-  const [drag, setDrag] = useState<number | null>(null) // preview seconds while dragging
+type TimelineTrack = {
+  key: string
+  name: string
+  color: string
+  points: TimelinePoint[]
+}
 
-  const ratio = (t: number) => (duration > 0 ? Math.min(1, Math.max(0, t / duration)) : 0)
-  const shown = drag ?? current
+// Hardcoded track set for now. Names/colors persist once renamed on a given
+// media item; a fresh media item falls back to these defaults.
+const DEFAULT_TRACKS: TimelineTrack[] = [
+  { key: 'a', name: 'Object 1', color: '#f87171', points: [] },
+  { key: 'b', name: 'Object 2', color: '#38bdf8', points: [] },
+]
 
-  const timeFromEvent = (e: ReactPointerEvent<HTMLDivElement>): number => {
-    const el = trackRef.current!
-    const rect = el.getBoundingClientRect()
-    const p = rect.width > 0 ? (e.clientX - rect.left) / rect.width : 0
-    return Math.min(1, Math.max(0, p)) * duration
+// Okabe-Ito palette: engineered to be maximally distinct and colorblind-safe
+// (deuteranopia/protanopia/tritanopia). With only 8 entries it wraps, so each
+// full cycle (`cycle` >= 1) darkens the color toward black to keep repeats
+// identifiable against the dark timeline background.
+const TRACK_COLORS = [
+  '#000000',
+  '#e69f00',
+  '#56b4e9',
+  '#009e73',
+  '#f0e442',
+  '#0072b2',
+  '#d55e00',
+  '#cc79a7',
+]
+const TRACK_COLOR_DARKEN_PER_CYCLE = 0.28 // darkening multiplier per full wrap (capped)
+
+function darkenHex(hex: string, amount: number): string {
+  const n = parseInt(hex.slice(1), 16)
+  const r = Math.round(((n >> 16) & 255) * (1 - amount))
+  const g = Math.round(((n >> 8) & 255) * (1 - amount))
+  const b = Math.round((n & 255) * (1 - amount))
+  return '#' + [r, g, b].map((c) => c.toString(16).padStart(2, '0')).join('')
+}
+
+// Color for the track at the given ordinal: base Okabe-Ito entry, darkened on
+// each palette wrap so repeats stay distinguishable.
+function trackColor(index: number): string {
+  const base = TRACK_COLORS[index % TRACK_COLORS.length]
+  const cycle = Math.floor(index / TRACK_COLORS.length)
+  return cycle === 0
+    ? base
+    : darkenHex(base, Math.min(cycle, 3) * TRACK_COLOR_DARKEN_PER_CYCLE)
+}
+
+// Merge the default track set into whatever a media item persisted, appending
+// any default tracks that aren't already present (matched by key). This lets
+// new default tracks surface on already-saved items instead of only on fresh
+// ones.
+function withDefaultTracks(saved: TimelineTrack[]): TimelineTrack[] {
+  const present = new Set(saved.map((t) => t.key))
+  const missing = DEFAULT_TRACKS.filter((d) => !present.has(d.key))
+  return missing.length ? [...saved, ...missing] : saved
+}
+
+const LANE_H = 32 // px height shared by every lane row for column alignment
+const RULER_H = 18 // px height of the time ruler above the lanes
+
+// Zoom (pixels per second) limits for the scrollable timeline. The upper bound
+// is high enough that the finest sub-second grid step (10 ms) can be selected
+// once the lines are >= 26px apart.
+const ZOOM_MIN_PPS = 5
+const ZOOM_MAX_PPS = 2600
+
+function clamp01(n: number): number {
+  return Math.min(1, Math.max(0, n))
+}
+
+function clampN(n: number, lo: number, hi: number): number {
+  return Math.min(hi, Math.max(lo, n))
+}
+
+// Round to 1 ms so float hair-lines don't collide with duplicate keys.
+function roundT(t: number): number {
+  return Math.round(t * 1000) / 1000
+}
+
+// Label for a ruler tick: for whole-second steps show a bare integer, but for
+// sub-second steps keep as many decimals as the step implies (0.05 -> 2 decimal
+// places, 0.01 -> 2, 0.002 -> 3) so adjacent ticks never repeat the same text.
+function tickLabel(t: number, step: number): string {
+  if (step >= 1) return String(Math.round(t))
+  let decimals = 0
+  let s = step
+  while (s < 1) {
+    s *= 10
+    decimals++
+  }
+  if (Math.round(t) === t) return String(t)
+  return t.toFixed(decimals).replace(/0+$/, '')
+}
+
+// One track row: color chip, name, settings gear, and a rename popup.
+function TrackRowHeading({
+  track,
+  selected,
+  onSelect,
+  onRename,
+}: {
+  track: TimelineTrack
+  selected: boolean
+  onSelect: () => void
+  onRename: (name: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [draft, setDraft] = useState(track.name)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    setDraft(track.name)
+    const t = setTimeout(() => inputRef.current?.focus(), 0)
+    return () => clearTimeout(t)
+  }, [open, track.name])
+
+  // Close on Escape while the dialog is open.
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open])
+
+  const commit = (e?: { preventDefault(): void }) => {
+    e?.preventDefault()
+    const next = draft.trim()
+    if (next && next !== track.name) onRename(next)
+    setOpen(false)
   }
 
   return (
-    <div className="flex w-full items-center gap-3">
-      <div
-        ref={trackRef}
-        className="group relative h-1.5 flex-1 cursor-pointer rounded-full bg-white/10"
-        onPointerDown={(e) => {
-          e.currentTarget.setPointerCapture(e.pointerId)
-          onSeek(timeFromEvent(e))
-          setDrag(timeFromEvent(e))
-        }}
-        onPointerMove={(e) => {
-          if ((e.buttons & 1) !== 0) {
-            onSeek(timeFromEvent(e))
-            setDrag(timeFromEvent(e))
-          }
-        }}
-        onPointerUp={(e) => {
-          onSeek(timeFromEvent(e))
-          setDrag(null)
-        }}
-        onPointerCancel={() => setDrag(null)}
+    <div
+      onClick={onSelect}
+      className={`relative flex cursor-pointer items-center gap-1.5 border-b border-white/5 px-2 ${
+        selected ? 'bg-white/5' : ''
+      }`}
+      style={{ height: LANE_H }}
+    >
+      <span
+        className="h-2 w-2 shrink-0 rounded-full"
+        style={{ background: track.color }}
+      />
+      <span
+        className={`min-w-0 flex-1 truncate text-xs ${
+          selected ? 'text-white' : 'text-neutral-400'
+        }`}
+        title={track.name}
       >
-        {/* buffered fill */}
-        <div
-          className="absolute inset-y-0 left-0 rounded-full bg-white/15"
-          style={{ width: `${ratio(buffered) * 100}%` }}
-        />
-        {/* played/scrubbed fill */}
-        <div
-          className="absolute inset-y-0 left-0 rounded-full bg-blue-500"
-          style={{ width: `${ratio(shown) * 100}%` }}
-        />
-        {/* thumb */}
-        <div
-          className="absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white shadow-md group-hover:scale-110"
-          style={{ left: `calc(${ratio(shown) * 100}% - 7px)` }}
-        />
+        {track.name}
+      </span>
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          setOpen(true)
+        }}
+        aria-label={`Settings for ${track.name}`}
+        title="Track settings"
+        className={`shrink-0 cursor-pointer rounded p-0.5 transition-colors hover:bg-white/10 hover:text-white ${
+          open ? 'text-white' : 'text-neutral-500'
+        }`}
+      >
+        <Settings2 size={12} />
+      </button>
+
+      {open &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setOpen(false)
+            }}
+            role="dialog"
+            aria-modal="true"
+            aria-label={`Track settings: ${track.name}`}
+          >
+            <div className="w-full max-w-sm rounded-xl border border-white/10 bg-[#0e1116] p-5 shadow-2xl">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-sm font-semibold">Track settings</h2>
+                <button
+                  onClick={() => setOpen(false)}
+                  aria-label="Close"
+                  className="cursor-pointer rounded-md p-1 text-neutral-500 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="mb-4 flex items-center gap-2">
+                <span
+                  className="h-3 w-3 shrink-0 rounded-full"
+                  style={{ background: track.color }}
+                />
+                <span className="text-xs text-neutral-400">
+                  {track.points.length} marker{track.points.length === 1 ? '' : 's'}
+                </span>
+              </div>
+              <label className="block text-[11px] uppercase tracking-wider text-neutral-500">
+                Track name
+              </label>
+              <input
+                ref={inputRef}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commit()
+                  else if (e.key === 'Escape') setOpen(false)
+                }}
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-blue-500"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  onClick={() => setOpen(false)}
+                  className="cursor-pointer rounded-md px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:bg-white/10"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={commit}
+                  className="cursor-pointer rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-blue-500"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+    </div>
+  )
+}
+
+type TimelineProps = {
+  current: number
+  duration: number
+  buffered: number
+  playing: boolean
+  tracks: TimelineTrack[] | null
+  selectedKey: string | null
+  onSeek: (t: number) => void
+  onSelectTrack: (key: string) => void
+  onRenameTrack: (key: string, name: string) => void
+  onAddTrack: () => void
+  onRemoveTrack: () => void
+}
+
+function Timeline({
+  current,
+  duration,
+  buffered,
+  playing,
+  tracks,
+  selectedKey,
+  onSeek,
+  onSelectTrack,
+  onRenameTrack,
+  onAddTrack,
+  onRemoveTrack,
+}: TimelineProps) {
+  // Scroll + zoom state. Zoom is pixels-per-second; the lane area scrolls
+  // horizontally whenever the content is wider than the viewport.
+  const scrollRef = useRef<HTMLDivElement>(null)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const sbDragRef = useRef<{ startX: number; startScrollLeft: number } | null>(null)
+  const [drag, setDrag] = useState<number | null>(null)
+  const [pps, setPps] = useState(32)
+  const [scrollLeft, setScrollLeft] = useState(0)
+  const [viewportW, setViewportW] = useState(0)
+  const [manual, setManual] = useState(false)
+
+  const shown = drag ?? current
+
+  // Measure the scroll viewport so we can auto-fit and cull off-screen grids.
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const ro = new ResizeObserver((entries) => {
+      for (const e of entries) setViewportW(e.contentRect.width)
+    })
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+
+  const zoomToFit = useCallback(() => {
+    if (duration > 0 && viewportW > 0) {
+      setPps(clampN(viewportW / duration, ZOOM_MIN_PPS, ZOOM_MAX_PPS))
+    }
+  }, [duration, viewportW])
+
+  // Auto-fit to the whole clip on load / when duration changes, unless the
+  // user has zoomed by hand.
+  useEffect(() => {
+    if (!manual) zoomToFit()
+  }, [duration, viewportW, manual, zoomToFit])
+
+  const contentW =
+    duration > 0
+      ? Math.max(1, Math.max(duration * pps, viewportW))
+      : Math.max(1, viewportW)
+
+  // Custom scrollbar geometry. The lane area's native scrollbar is hidden, so
+  // a track + thumb are drawn below it; the thumb's size reflects the visible
+  // fraction and its position mirrors scrollLeft.
+  const scrollable = Math.max(0, contentW - viewportW)
+  const trackW = viewportW > 0 ? viewportW : 1
+  const sbThumbW =
+    scrollable > 0 && contentW > 0
+      ? Math.max(28, Math.min(trackW, (viewportW / contentW) * trackW))
+      : 0
+  const sbThumbX =
+    scrollable > 0 ? clampN((scrollLeft / scrollable) * (trackW - sbThumbW), 0, trackW - sbThumbW) : 0
+
+  // Major grid lines within the visible span, spacing auto-coarsened with the
+  // zoom so lines stay >= 26px apart, and only rendered for the visible window.
+  const grid = useMemo(() => {
+    if (duration <= 0 || viewportW <= 0 || pps <= 0) return { major: [], step: 1 }
+    const majorSteps = [0.002, 0.005, 0.01, 0.02, 0.025, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1800, 3600]
+    const step = majorSteps.find((s) => pps * s >= 26) ?? majorSteps[majorSteps.length - 1]
+    const startT = Math.max(0, Math.min(duration, scrollLeft / pps))
+    const endT = Math.max(0, Math.min(duration, (scrollLeft + viewportW) / pps))
+    const majorLines: number[] = []
+    for (let t = Math.floor(startT / step) * step; t <= endT + 1e-9; t += step) {
+      if (t >= 0) majorLines.push(roundT(t))
+    }
+    return { major: majorLines, step }
+  }, [duration, viewportW, pps, scrollLeft])
+
+
+  // Keep the playhead in view while playing.
+  useEffect(() => {
+    if (!playing || duration <= 0) return
+    const el = scrollRef.current
+    if (!el) return
+    const px = shown * pps
+    const right = el.clientWidth
+    if (px < el.scrollLeft + 6 || px > el.scrollLeft + right - 6) {
+      el.scrollLeft = clampN(px - right * 0.45, 0, el.scrollWidth - el.clientWidth)
+    }
+  }, [playing, shown, pps, viewportW, duration])
+
+  const timeFromEvent = (clientX: number): number => {
+    const el = contentRef.current!
+    const rect = el.getBoundingClientRect()
+    const fx = rect.width > 0 ? (clientX - rect.left) / rect.width : 0
+    return clamp01(fx) * duration
+  }
+
+  const beginDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId)
+    const t = timeFromEvent(e.clientX)
+    onSeek(t)
+    setDrag(t)
+  }
+  const duringDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if ((e.buttons & 1) !== 0) {
+      const t = timeFromEvent(e.clientX)
+      onSeek(t)
+      setDrag(t)
+    }
+  }
+  const endDrag = (e: ReactPointerEvent<HTMLDivElement>) => {
+    onSeek(timeFromEvent(e.clientX))
+    setDrag(null)
+  }
+
+  // Custom scrollbar dragging. Clicking/tapping the track jumps the thumb so
+  // its center lands under the pointer; dragging maps the movement onto the
+  // scrollable pixel range of the lane content.
+  const beginSb = (e: ReactPointerEvent<HTMLDivElement>) => {
+    e.currentTarget.setPointerCapture(e.pointerId)
+    const el = scrollRef.current
+    if (!el) return
+    const rect = e.currentTarget.getBoundingClientRect()
+    const trackX = e.clientX - rect.left
+    const denom = Math.max(1, rect.width - sbThumbW)
+    const targetFrac = clampN((trackX - sbThumbW / 2) / denom, 0, 1)
+    el.scrollLeft = clampN(targetFrac * scrollable, 0, scrollable)
+    sbDragRef.current = { startX: e.clientX, startScrollLeft: el.scrollLeft }
+  }
+  const moveSb = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const drag = sbDragRef.current
+    const el = scrollRef.current
+    if (!drag || !el || (e.buttons & 1) === 0) return
+    e.currentTarget.setPointerCapture(e.pointerId)
+    const denom = Math.max(1, trackW - sbThumbW)
+    const dScroll = ((e.clientX - drag.startX) / denom) * scrollable
+    el.scrollLeft = clampN(drag.startScrollLeft + dScroll, 0, scrollable)
+  }
+  const endSb = () => {
+    sbDragRef.current = null
+  }
+
+  // Zoom with the mouse wheel, anchored at the cursor: the time under the
+  // pointer stays under it while the window zooms in/out. Attached natively
+  // with passive:false so default horizontal scrolling is suppressed while
+  // zooming (pure vertical wheel scroll is left to the scrollbar/touch).
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el) return
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      const rect = el.getBoundingClientRect()
+      const cursorX = e.clientX - rect.left
+      // Guard against degenerate 0-time or 0-width cursor / viewport pos.
+      if (duration <= 0 || pps <= 0 || rect.width <= 0) return
+      const timeAtCursor = (el.scrollLeft + cursorX) / pps
+      const factor = clampN(Math.pow(1.0015, -e.deltaY), 0.5, 2)
+      const next = clampN(pps * factor, ZOOM_MIN_PPS, ZOOM_MAX_PPS)
+      if (next === pps) return
+      setManual(true)
+      setPps(next)
+      el.scrollLeft = clampN(
+        timeAtCursor * next - cursorX,
+        0,
+        Math.max(0, el.scrollWidth - el.clientWidth),
+      )
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [pps, duration])
+
+  return (
+    <div className="mt-6 w-full">
+      <div className="flex w-full select-none">
+        {/* left label column (aligned by shared LANE_H rows) */}
+        <div className="w-40 shrink-0 pr-3">
+          <div style={{ height: RULER_H }} />
+          {/* add / remove track actions, on the same row as the progress lane */}
+          <div
+            className="flex items-center gap-1 px-1"
+            style={{ height: LANE_H }}
+          >
+            <button
+              onClick={onAddTrack}
+              aria-label="Add track"
+              title="Add track"
+              disabled={!tracks}
+              className="flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-sm text-neutral-400 transition-colors hover:bg-white/5 hover:text-white disabled:cursor-default disabled:opacity-40"
+            >
+              <Plus size={15} />
+            </button>
+            <button
+              onClick={onRemoveTrack}
+              aria-label="Remove selected track"
+              title="Remove selected track"
+              disabled={!tracks || !selectedKey || (tracks && tracks.length <= 1)}
+              className="flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-sm text-neutral-400 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:cursor-default disabled:opacity-40"
+            >
+              <Minus size={15} />
+            </button>
+          </div>
+          {tracks?.map((t) => (
+            <TrackRowHeading
+              key={t.key}
+              track={t}
+              selected={t.key === selectedKey}
+              onSelect={() => onSelectTrack(t.key)}
+              onRename={(name) => onRenameTrack(t.key, name)}
+            />
+          ))}
+        </div>
+
+        {/* scrollable lane area (ruler + grids + lanes + playhead) with the
+            custom scrollbar track drawn below it */}
+        <div className="relative min-w-0 flex-1">
+          <div
+            ref={scrollRef}
+            onScroll={(e) => setScrollLeft(e.currentTarget.scrollLeft)}
+            className="scrollbar-none relative overflow-x-auto overflow-y-hidden"
+          >
+            <div ref={contentRef} className="relative" style={{ width: contentW, minWidth: '100%' }}>
+              {/* ruler: labels only on adaptive major gridlines */}
+              <div className="relative z-10 overflow-hidden" style={{ height: RULER_H }}>
+                {grid.major.map((s) =>
+                  s === 0 ? null : (
+                    <div
+                      key={`l${s}`}
+                      className="absolute top-0 -translate-x-1/2 whitespace-nowrap rounded-sm px-1 text-[11px] tabular-nums text-neutral-500"
+                      style={{ left: `${s * pps}px`, background: 'var(--page-bg)' }}
+                    >
+                      {tickLabel(s, grid.step)}
+                    </div>
+                  ),
+                )}
+              </div>
+
+              {/* grid layer: major vertical lines across ruler + all lanes, behind them */}
+              <div className="pointer-events-none absolute inset-0 z-0">
+                {grid.major.map((s) => (
+                  <div
+                    key={`M${s}`}
+                    className="absolute inset-y-0 w-px bg-white/[0.13]"
+                    style={{ left: `${s * pps}px` }}
+                  />
+                ))}
+              </div>
+
+              {/* progress lane */}
+              <div
+                className="relative z-10 flex cursor-pointer items-center"
+                style={{ height: LANE_H }}
+                onPointerDown={beginDrag}
+                onPointerMove={duringDrag}
+                onPointerUp={endDrag}
+                onPointerCancel={() => setDrag(null)}
+              >
+                <div className="relative h-1.5 w-full">
+                  <div className="absolute inset-0 rounded-full bg-white/10" />
+                  <div
+                    className="absolute inset-y-0 left-0 rounded-full bg-white/15"
+                    style={{ width: `${buffered * pps}px` }}
+                  />
+                  <div
+                    className="absolute inset-y-0 left-0 rounded-full bg-blue-500"
+                    style={{ width: `${shown * pps}px` }}
+                  />
+                  <div
+                    className="absolute top-1/2 h-3.5 w-3.5 -translate-y-1/2 rounded-full bg-white shadow-md"
+                    style={{ left: `${shown * pps - 7}px` }}
+                  />
+                </div>
+              </div>
+
+              {/* track lanes; not clickable for scrubbing, only the markers are */}
+              {tracks?.map((t) => (
+                <div
+                  key={t.key}
+                  className={`relative border-b border-white/5 ${
+                    t.key === selectedKey ? 'bg-white/[0.07]' : ''
+                  }`}
+                  style={{ height: LANE_H }}
+                >
+                  {t.points.map((pt, i) => (
+                    <div
+                      key={i}
+                      title={`${t.name} @ ${formatTime(pt.t)}`}
+                      className="absolute top-1/2 h-2.5 w-2.5 -translate-x-1/2 -translate-y-1/2 cursor-pointer rounded-full shadow"
+                      style={{ left: `${pt.t * pps}px`, background: t.color }}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        onSeek(pt.t)
+                      }}
+                    />
+                  ))}
+                </div>
+              ))}
+
+              {/* playhead: thin vertical line spanning the whole timeline */}
+              <div
+                className="pointer-events-none absolute inset-y-0 z-20 w-px -translate-x-1/2 bg-white/60"
+                style={{ left: `${shown * pps}px` }}
+              />
+            </div>
+          </div>
+
+          {/* custom scrollbar (only shown when content overflows the viewport) */}
+          {scrollable > 0 && (
+            <div
+              className="relative mt-1 h-2 w-full cursor-pointer"
+              onPointerDown={beginSb}
+              onPointerMove={moveSb}
+              onPointerUp={endSb}
+              onPointerCancel={endSb}
+            >
+              <div className="absolute inset-x-0 top-1/2 h-1 -translate-y-1/2 rounded-full bg-white/10" />
+              <div
+                className="absolute top-1/2 h-1 -translate-y-1/2 rounded-full bg-white/30 transition-colors hover:bg-white/50"
+                style={{ left: sbThumbX, width: sbThumbW }}
+              />
+            </div>
+          )}
+        </div>
       </div>
     </div>
   )
 }
 
-// --- video player with scrubber --------------------------------------------
+// --- video player with timeline --------------------------------------------
 
 function VideoPlayer({ id }: { id: string }) {
   const videoRef = useRef<HTMLVideoElement>(null)
@@ -329,6 +863,122 @@ function VideoPlayer({ id }: { id: string }) {
   const [playing, setPlaying] = useState(false)
   const [buffered, setBuffered] = useState(0)
   const [loop, setLoop] = useState(false)
+  const [tracks, setTracks] = useState<TimelineTrack[] | null>(null)
+  const [selectedKey, setSelectedKey] = useState<string | null>(null)
+
+  // Load persisted timeline state for this media item.
+  useEffect(() => {
+    let alive = true
+    setTracks(null)
+    fetch(`/api/timeline/${encodeURIComponent(id)}`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((body) => {
+        if (!alive) return
+        const stored = Array.isArray(body?.tracks) && body.tracks.length
+          ? withDefaultTracks(body.tracks)
+          : withDefaultTracks(DEFAULT_TRACKS)
+        setTracks(stored)
+        setSelectedKey((prev) => prev ?? stored[0]?.key ?? null)
+      })
+      .catch(() => {
+        if (!alive) return
+        setTracks(DEFAULT_TRACKS)
+        setSelectedKey((prev) => prev ?? DEFAULT_TRACKS[0]?.key ?? null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [id])
+
+  // Persist the full timeline state after every change.
+  const saveTimeline = useCallback(
+    (next: TimelineTrack[]) => {
+      fetch(`/api/timeline/${encodeURIComponent(id)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tracks: next }),
+      }).catch(() => {})
+    },
+    [id],
+  )
+
+  const addMarker = useCallback(
+    (key: string, point: TimelinePoint) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) =>
+          t.key === key ? { ...t, points: [...t.points, point] } : t,
+        )
+        saveTimeline(next)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
+  const selectTrack = useCallback((key: string) => setSelectedKey(key), [])
+
+  const renameTrack = useCallback(
+    (key: string, name: string) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) => (t.key === key ? { ...t, name } : t))
+        saveTimeline(next)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
+  const addTrack = useCallback(() => {
+    if (!tracks) return
+    const key = crypto.randomUUID()
+    // Insert the new track directly after the selected one (top of the list
+    // when nothing is selected), rather than appending to the end.
+    const selectedIndex = selectedKey
+      ? tracks.findIndex((t) => t.key === selectedKey)
+      : -1
+    const insertAt = selectedIndex >= 0 ? selectedIndex + 1 : 0
+    const created: TimelineTrack = {
+      key,
+      name: `Track ${tracks.length + 1}`,
+      color: trackColor(tracks.length),
+      points: [],
+    }
+    const next: TimelineTrack[] = [
+      ...tracks.slice(0, insertAt),
+      created,
+      ...tracks.slice(insertAt),
+    ]
+    setTracks(next)
+    setSelectedKey(key)
+    saveTimeline(next)
+  }, [tracks, selectedKey, saveTimeline])
+
+  const removeTrack = useCallback(() => {
+    if (!tracks || !selectedKey || tracks.length <= 1) return
+    // The track above the one being removed (original array order), falling
+    // back to the topmost remaining track when the removed one was first.
+    const removedIndex = tracks.findIndex((t) => t.key === selectedKey)
+    const next = tracks.filter((t) => t.key !== selectedKey)
+    const above = removedIndex > 0 ? next[removedIndex - 1] : null
+    setTracks(next)
+    setSelectedKey(above?.key ?? next[0]?.key ?? null)
+    saveTimeline(next)
+  }, [tracks, selectedKey, saveTimeline])
+
+  // Clicking the video drops a marker on the selected track at playhead time,
+  // remembering where on the frame the click landed.
+  const onVideoClick = useCallback(
+    (e: ReactMouseEvent<HTMLVideoElement>) => {
+      if (!tracks || !selectedKey) return
+      const rect = e.currentTarget.getBoundingClientRect()
+      const x = rect.width > 0 ? clamp01((e.clientX - rect.left) / rect.width) : 0
+      const y = rect.height > 0 ? clamp01((e.clientY - rect.top) / rect.height) : 0
+      addMarker(selectedKey, { t: current, x, y })
+    },
+    [tracks, selectedKey, current, addMarker],
+  )
 
   // Keep the video element's loop flag in sync with state, and pause on
   // ended when looping is off (native ended control handles loop itself).
@@ -470,10 +1120,36 @@ function VideoPlayer({ id }: { id: string }) {
         <video
           ref={videoRef}
           src={mediaUrl(id)}
-          className="h-full w-full object-contain"
+          onClick={onVideoClick}
+          className="h-full w-full cursor-crosshair object-contain"
           controls={false}
           playsInline
         />
+        {tracks && selectedKey && tracks.length > 0 && (
+          <div className="pointer-events-none absolute left-2 top-2 rounded bg-black/50 px-2 py-0.5 text-[10px] text-neutral-300">
+            Click to mark on{' '}
+            <span
+              className="font-medium"
+              style={{ color: tracks.find((t) => t.key === selectedKey)?.color }}
+            >
+              {tracks.find((t) => t.key === selectedKey)?.name}
+            </span>
+          </div>
+        )}
+        {/* overlay dots flashing on the video as the playhead passes each marker */}
+        {(tracks ?? [])
+          .flatMap((t) =>
+            t.points
+              .filter((p) => Math.abs(current - p.t) <= 0.05)
+              .map((p) => ({ ...p, color: t.color })),
+          )
+          .map((m, i) => (
+            <div
+              key={i}
+              className="pointer-events-none absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-black/60"
+              style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, background: m.color }}
+            />
+          ))}
       </div>
 
       <div className="mt-3 flex items-center justify-center gap-1 text-xs tabular-nums text-neutral-400">
@@ -482,7 +1158,7 @@ function VideoPlayer({ id }: { id: string }) {
         <span>{formatTime(duration)}</span>
       </div>
 
-      <div className="mt-3 flex items-center justify-center gap-2.5">
+      <div className="mt-2 flex items-center justify-center gap-2.5">
         <button
           onClick={() => stepFrame(-1)}
           aria-label="Step back one frame"
@@ -492,19 +1168,19 @@ function VideoPlayer({ id }: { id: string }) {
           <StepBack size={14} />
         </button>
         <button
-          onClick={toggle}
-          aria-label={playing ? 'Pause' : 'Play'}
-          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-blue-600 text-white transition-colors hover:bg-blue-500"
-        >
-          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
-        </button>
-        <button
           onClick={stop}
           aria-label="Stop"
           title="Stop"
           className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-white/10 text-neutral-300 transition-colors hover:bg-white/15 hover:text-white"
         >
           <Square size={11} fill="currentColor" />
+        </button>
+        <button
+          onClick={toggle}
+          aria-label={playing ? 'Pause' : 'Play'}
+          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-blue-600 text-white transition-colors hover:bg-blue-500"
+        >
+          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
         </button>
         <button
           onClick={() => setLoop((l) => !l)}
@@ -529,14 +1205,19 @@ function VideoPlayer({ id }: { id: string }) {
         </button>
       </div>
 
-      <div className="mt-3">
-        <Scrubber
-          current={current}
-          duration={duration}
-          buffered={buffered}
-          onSeek={seek}
-        />
-      </div>
+      <Timeline
+        current={current}
+        duration={duration}
+        buffered={buffered}
+        playing={playing}
+        tracks={tracks}
+        selectedKey={selectedKey}
+        onSeek={seek}
+        onSelectTrack={selectTrack}
+        onRenameTrack={renameTrack}
+        onAddTrack={addTrack}
+        onRemoveTrack={removeTrack}
+      />
     </>
   )
 }

@@ -13,7 +13,10 @@ internally under a UUID name (``<data_dir>/media/<uuid>``) with their display
 name and MIME type kept in a SQLite database (``<data_dir>/media.db``).  The
 browser can list it (``GET /api/media``), upload pictures/videos to it
 (``POST /api/media``, multipart/form-data), fetch the files back
-(``GET /media/<id>``) and rename them (``POST /api/media/rename``).
+(``GET /media/<id>``) and rename them (``POST /api/media/rename``).  Each
+media item also carries a timeline (tracks + marker points) stored as JSON in
+the same database, readable via ``GET /api/timeline/<id>`` and saved with
+``POST /api/timeline/<id>``.
 """
 
 import json
@@ -118,6 +121,13 @@ class MediaPlayerBackend:
             # real files even though the backing files are UUIDs.
             conn.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_name ON media(name)")
+            # Per-media timeline state (tracks + markers) persisted as JSON.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS timeline (
+                    media_id TEXT PRIMARY KEY,
+                    data     TEXT NOT NULL
+                )
+            """)
             conn.commit()
 
     def list_media(self) -> list[dict]:
@@ -170,6 +180,29 @@ class MediaPlayerBackend:
         while self.name_exists(f"{stem}-{n}{ext}"):
             n += 1
         return f"{stem}-{n}{ext}"
+
+    def get_timeline(self, media_id: str) -> dict | None:
+        """Return the stored timeline state for a media item, or None."""
+        with closing(self._db()) as conn:
+            row = conn.execute(
+                "SELECT data FROM timeline WHERE media_id = ?", (media_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            data = json.loads(row["data"])
+        except (ValueError, TypeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def save_timeline(self, media_id: str, data: dict) -> None:
+        """Persist a media item's full timeline state (upsert by media id)."""
+        with closing(self._db()) as conn:
+            conn.execute(
+                "INSERT INTO timeline (media_id, data) VALUES (?, ?) "
+                "ON CONFLICT(media_id) DO UPDATE SET data = excluded.data",
+                (media_id, json.dumps(data)))
+            conn.commit()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -325,6 +358,67 @@ class _Handler(BaseHTTPRequestHandler):
             f"renamed media '{mid}' -> '{new}'")
         self._respond(200, {"id": mid, "name": new})
 
+    def _handle_timeline_get(self, media_id: str) -> None:
+        rec = self.backend.get_media(media_id)
+        if rec is None:
+            self._respond(404, {"error": "not found"})
+            return
+        data = self.backend.get_timeline(media_id) or {}
+        self._respond(200, {"media": media_id, "tracks": data.get("tracks", [])})
+
+    def _handle_timeline_post(self, media_id: str) -> None:
+        rec = self.backend.get_media(media_id)
+        if rec is None:
+            self._respond(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._respond(400, {"error": "bad content-length"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self._respond(400, {"error": "expected JSON body"})
+            return
+        tracks = payload.get("tracks") if isinstance(payload, dict) else None
+        if not isinstance(tracks, list):
+            self._respond(400, {"error": "expected {tracks: [...]}"})
+            return
+        # Sanitize to a stable shape so the table never stores junk.
+        clean = []
+        for t in tracks:
+            if not isinstance(t, dict):
+                continue
+            key = str(t.get("key", ""))
+            if not key:
+                continue
+            color = t.get("color") or ""
+            name = (t.get("name") or "").strip() or "Track"
+            points = []
+            for p in t.get("points", []):
+                if isinstance(p, (int, float)):
+                    # Legacy scalar markers (time only); center them on the frame.
+                    points.append({"t": float(p), "x": 0.5, "y": 0.5})
+                elif isinstance(p, dict):
+                    try:
+                        tt = float(p.get("t"))
+                    except (TypeError, ValueError):
+                        continue
+                    x = p.get("x", 0.5)
+                    y = p.get("y", 0.5)
+                    points.append({
+                        "t": tt,
+                        "x": float(x) if isinstance(x, (int, float)) else 0.5,
+                        "y": float(y) if isinstance(y, (int, float)) else 0.5,
+                    })
+            clean.append({"key": key, "name": name, "color": color, "points": points})
+        self.backend.save_timeline(media_id, {"tracks": clean})
+        self.backend.node.get_logger().info(
+            f"saved timeline for '{media_id}' ({len(clean)} tracks, "
+            f"{sum(len(c['points']) for c in clean)} markers)")
+        self._respond(200, {"ok": True})
+
     # --- routes ------------------------------------------------------------
 
     def do_GET(self):
@@ -345,6 +439,9 @@ class _Handler(BaseHTTPRequestHandler):
             })
         elif route == "/api/media":
             self._respond(200, {"media": self._list_media()})
+        elif route.startswith("/api/timeline/"):
+            mid = urllib.parse.unquote(route[len("/api/timeline/"):])
+            self._handle_timeline_get(mid)
         elif route.startswith("/media/"):
             self._serve_media(route[len("/media/"):])
         else:
@@ -369,6 +466,11 @@ class _Handler(BaseHTTPRequestHandler):
 
         if route == "/api/media/rename":
             self._handle_rename()
+            return
+
+        if route.startswith("/api/timeline/"):
+            mid = urllib.parse.unquote(route[len("/api/timeline/"):])
+            self._handle_timeline_post(mid)
             return
 
         if route != "/publish":
