@@ -856,7 +856,7 @@ function Timeline({
 
 // --- video player with timeline --------------------------------------------
 
-function VideoPlayer({ id }: { id: string }) {
+function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: number }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [current, setCurrent] = useState(0)
   const [duration, setDuration] = useState(0)
@@ -933,6 +933,12 @@ function VideoPlayer({ id }: { id: string }) {
   )
 
   const selectTrack = useCallback((key: string) => setSelectedKey(key), [])
+
+  // Unselect the current track when the user clicks away (empty space outside
+  // the timeline); MediaPage bumps `deselectSignal` on a background click.
+  useEffect(() => {
+    if (deselectSignal > 0) setSelectedKey(null)
+  }, [deselectSignal])
 
   const renameTrack = useCallback(
     (key: string, name: string) => {
@@ -1253,6 +1259,7 @@ function MediaPage({ id }: { id: string }) {
   const [draft, setDraft] = useState('')
   const [renameError, setRenameError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
+  const [deselectSignal, setDeselectSignal] = useState(0)
   const inputRef = useRef<HTMLInputElement>(null)
 
   // Resolve id -> {name, kind} from the gallery listing.
@@ -1374,7 +1381,13 @@ function MediaPage({ id }: { id: string }) {
   const isVideo = kind === 'video'
 
   return (
-    <main className="flex min-h-screen flex-col px-7 py-6">
+    <main
+      className="flex min-h-screen flex-col px-7 py-6"
+      // Clicking empty page space (outside the timeline) unselects the track.
+      onClick={(e) => {
+        if (e.target === e.currentTarget) setDeselectSignal((n) => n + 1)
+      }}
+    >
       <header className="mb-4 flex items-center gap-3">
         {backArrow}
 
@@ -1410,7 +1423,7 @@ function MediaPage({ id }: { id: string }) {
       {renameError && <p className="mb-3 text-sm text-red-400">{renameError}</p>}
 
       {isVideo ? (
-        <VideoPlayer id={id} />
+        <VideoPlayer id={id} deselectSignal={deselectSignal} />
       ) : (
         <img
           src={mediaUrl(id)}
