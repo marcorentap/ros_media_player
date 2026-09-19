@@ -1154,6 +1154,11 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     let alive = true
     setProcessing(true)
     setPlaySrc(null)
+    // A config change (fps/width/height) live-swaps the normalized stream.
+    // If the node was mid-stream, stop it now so it doesn't keep publishing
+    // frames at the stale settings while the new stream is being built.
+    const v = videoRef.current
+    sendControlRef.current('stop', v ? v.currentTime : 0)
     fetch('/api/preprocess', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1331,6 +1336,10 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     if (processingRef.current) return
     const v = videoRef.current
     if (!v || !isFinite(t)) return
+    // Scrub always pauses playback (the user never scrubs into a running
+    // stream): it publishes one frame at t on the backend, so the video
+    // must not keep advancing past it.
+    v.pause()
     v.currentTime = t
     setCurrent(t)
     sendControl('scrub', t)

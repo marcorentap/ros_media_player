@@ -427,6 +427,11 @@ class _Player:
         self._alive = False
         self._playing = False
         self._t = 0.0
+        # A playback action ("pause"/"stop"/"scrub") requested while the
+        # cursor was still behind its target media-time. It is completed by
+        # pace() once self._t reaches the target, instead of snapping the
+        # cursor forward immediately. Tuple (cmd, target_t) or None.
+        self._deferred = None
         self._media_id = None
         self._path = None
         self._w = 0
@@ -443,6 +448,9 @@ class _Player:
         with self._lock:
             self._playing = False
             self._alive = False
+            # Any pending deferred action is moot once the stream is stopped:
+            # a play/stop/restart cancels a lagging catch-up.
+            self._deferred = None
             proc = self._proc
             self._proc = None
         if proc is not None:
@@ -593,6 +601,17 @@ class _Player:
                     return
                 if rgba is not None:
                     self._publish_frame(rgba)
+                # Complete a deferred action once the cursor reaches its
+                # target media-time (the frame at that time was just
+                # published), so pause/stop/scrub apply exactly at that point.
+                with self._lock:
+                    deferred = self._deferred
+                    reached = deferred is not None and self._t >= deferred[1]
+                if reached:
+                    dcmd, dt, dw, dh = self._deferred
+                    self._deferred = None
+                    self._apply_action(dcmd, dt, dw, dh)
+                    return
         self._pacer_thread = threading.Thread(target=pace, daemon=True)
         self._pacer_thread.start()
 
@@ -613,8 +632,29 @@ class _Player:
         with self._lock:
             self._playing = True
 
-    def set_frame(self, t, width, height):
-        """Paused update: set the cursor and publish the single frame at t."""
+    def queue_action(self, cmd, t, width, height):
+        """Queue a pause/stop/scrub with deferred semantics.
+
+        The frontend issues these relative to its own timeline. If a play
+        stream is currently running and the cursor is still *behind* the
+        requested media-time, keep streaming (publishing every frame) and only
+        apply the action once pace() reaches ``t``. If the cursor is already
+        at/on the far side of ``t`` -- or not streaming at all -- apply it
+        immediately. This way the node acts at that point in the media, never
+        by snapping forward past frames it hasn't reached yet.
+        """
+        with self._lock:
+            lagging = self._playing and self._t < t
+            if lagging:
+                # Write under the lock so pace() can't read a half-set tuple
+                # between the `lagging` check and this store.
+                self._deferred = (cmd, t, width, height)
+                return
+        self._apply_action(cmd, t, width, height)
+
+    def _apply_action(self, cmd, t, width=None, height=None):
+        """Paused update for pause/stop/scrub: stop the stream and publish the
+        single frame at ``t`` (with the cursor left there)."""
         self._stop()
         with self._lock:
             self._t = max(0.0, float(t))
@@ -1057,8 +1097,18 @@ class _Handler(BaseHTTPRequestHandler):
                         topic, frame_id, tracks)
             self._respond(200, {"ok": True, "cmd": "play", "t": t})
             return
-        if cmd in ("pause", "stop", "scrub"):
-            player.set_frame(t, s_w, s_h)
+        if cmd == "scrub":
+            # Scrub is one-shot and never deferred, and it always pauses the
+            # published stream: stop the live stream and publish the single
+            # frame at t immediately (it is not resumed afterward).
+            player._apply_action(cmd, t, s_w, s_h)
+            self._respond(200, {"ok": True, "cmd": cmd, "t": t})
+            return
+        if cmd in ("pause", "stop"):
+            # Deferred semantics: pause/stop take effect at media-time t.
+            # If the node's cursor is still behind t (frontend raced ahead),
+            # keep streaming and apply only once the cursor reaches it.
+            player.queue_action(cmd, t, s_w, s_h)
             self._respond(200, {"ok": True, "cmd": cmd, "t": t})
             return
         self._respond(400, {"error": f"unknown cmd: {cmd}"})
