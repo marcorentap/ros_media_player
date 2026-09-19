@@ -8,9 +8,11 @@
   --page-bg: #000112;
   /* muted blue derived from the page bg (mix 30% page / 70% slate-blue) */
   --thumb-bg: color-mix(in srgb, var(--page-bg) 30%, #1e293b 70%);
-  /* lighter variant of the page bg for the Upload button */
-  --btn-bg: color-mix(in srgb, var(--page-bg) 35%, #7d8fb0 65%);
-  --btn-bg-hover: color-mix(in srgb, var(--page-bg) 25%, #93a4c4 75%);
+  /* Upload button: blue when enabled (matches player controls), gray when disabled */
+  --btn-bg: #2563eb; /* blue-600 */
+  --btn-bg-hover: #3b82f6; /* blue-500 */
+  --btn-bg-disabled: rgba(255, 255, 255, 0.1); /* white/10 */
+  --btn-text-disabled: #d4d4d8; /* neutral-300 */
 }
 
 body {

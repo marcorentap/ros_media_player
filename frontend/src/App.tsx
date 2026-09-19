@@ -173,10 +173,10 @@ function Gallery() {
         <button
           onClick={() => inputRef.current?.click()}
           disabled={uploading}
-          className="flex cursor-pointer items-center gap-1.5 rounded-md px-3 py-1.5 text-sm text-white transition-colors hover:bg-(--btn-bg-hover) disabled:opacity-60"
+          className="flex h-7 cursor-pointer items-center gap-1.5 rounded-full px-3 text-sm text-white transition-colors hover:bg-(--btn-bg-hover) disabled:bg-(--btn-bg-disabled) disabled:text-(--btn-text-disabled)"
           style={{ backgroundColor: 'var(--btn-bg)' }}
         >
-          <Upload size={16} />
+          <Upload size={14} />
           {uploading ? 'Uploading…' : 'Upload'}
         </button>
         <input
