@@ -856,6 +856,13 @@ class _Handler(BaseHTTPRequestHandler):
         if isinstance(payload.get("fps"), (int, float)):
             fps = float(payload["fps"])
             out["fps"] = fps if (fps > 0 and fps == fps) else 0
+        # Persist the desired publish resolution too (0 = keep source size).
+        if isinstance(payload.get("width"), (int, float)):
+            w = int(payload["width"])
+            out["width"] = w if w > 0 else 0
+        if isinstance(payload.get("height"), (int, float)):
+            h = int(payload["height"])
+            out["height"] = h if h > 0 else 0
 
         # Capture the previously-stored markers BEFORE saving, so we can detect
         # and publish any newly-added point on the spot. This makes a marker
