@@ -21,6 +21,7 @@ import {
   Square,
   StepBack,
   StepForward,
+  Trash2,
   Upload,
   X,
 } from 'lucide-react'
@@ -1262,6 +1263,8 @@ function MediaPage({ id }: { id: string }) {
   const [renameError, setRenameError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [deselectSignal, setDeselectSignal] = useState(0)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
   // Resolve id -> {name, kind} from the gallery listing.
@@ -1347,6 +1350,20 @@ function MediaPage({ id }: { id: string }) {
     }
   }
 
+  const deleteItem = useCallback(async () => {
+    setBusy(true)
+    setDeleteError(null)
+    try {
+      const res = await fetch(`/api/media/${encodeURIComponent(id)}`, { method: 'DELETE' })
+      const body = (await res.json().catch(() => null)) as { error?: string } | null
+      if (!res.ok) throw new Error(body?.error ?? `HTTP ${res.status}`)
+      window.location.href = '/'
+    } catch (e) {
+      setDeleteError(`Delete failed: ${(e as Error).message}`)
+      setBusy(false)
+    }
+  }, [id])
+
   const backArrow = (
     <a
       href="/"
@@ -1418,11 +1435,70 @@ function MediaPage({ id }: { id: string }) {
             >
               <Pencil size={15} />
             </button>
+            <button
+              onClick={() => {
+                setDeleteError(null)
+                setConfirmDelete(true)
+              }}
+              disabled={busy}
+              aria-label="Delete"
+              title="Delete"
+              className="shrink-0 cursor-pointer rounded-md p-1 text-neutral-500 transition-colors hover:bg-white/5 hover:text-red-400 disabled:opacity-50"
+            >
+              <Trash2 size={15} />
+            </button>
           </h1>
         )}
       </header>
 
       {renameError && <p className="mb-3 text-sm text-red-400">{renameError}</p>}
+
+      {confirmDelete &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setConfirmDelete(false)
+            }}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete media"
+          >
+            <div className="w-full max-w-sm rounded-xl border border-white/10 bg-[#0e1116] p-5 shadow-2xl">
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="text-sm font-semibold">Delete media</h2>
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  aria-label="Close"
+                  className="cursor-pointer rounded-md p-1 text-neutral-500 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <p className="text-[13px] leading-relaxed text-neutral-300">
+                Delete <span className="font-medium text-white">{truncateName(name)}</span> permanently? This also removes its timeline.
+              </p>
+              {deleteError && <p className="mt-3 text-sm text-red-400">{deleteError}</p>}
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  onClick={() => setConfirmDelete(false)}
+                  disabled={busy}
+                  className="cursor-pointer rounded-md px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:bg-white/10 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={deleteItem}
+                  disabled={busy}
+                  className="cursor-pointer rounded-md bg-red-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-red-500 disabled:opacity-50"
+                >
+                  {busy ? 'Deleting…' : 'Delete'}
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
 
       {isVideo ? (
         <VideoPlayer id={id} deselectSignal={deselectSignal} />

@@ -165,6 +165,22 @@ class MediaPlayerBackend:
             conn.commit()
             return cur.rowcount > 0
 
+    def delete_media(self, mid: str) -> bool:
+        """Delete a media item: its DB row, timeline, and backing file."""
+        with closing(self._db()) as conn:
+            cur = conn.execute(
+                "DELETE FROM media WHERE id = ?", (mid,))
+            conn.execute(
+                "DELETE FROM timeline WHERE media_id = ?", (mid,))
+            conn.commit()
+        if cur.rowcount == 0:
+            return False
+        try:
+            os.remove(os.path.join(self.media_dir, mid))
+        except OSError:
+            pass
+        return True
+
     def name_exists(self, name: str) -> bool:
         with closing(self._db()) as conn:
             row = conn.execute(
@@ -447,6 +463,24 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._respond(404, {"error": "not found"})
         return
+
+    def _handle_delete(self, mid: str) -> None:
+        mid = urllib.parse.unquote(mid)
+        if self.backend.get_media(mid) is None:
+            self._respond(404, {"error": "not found"})
+            return
+        self.backend.delete_media(mid)
+        self.backend.node.get_logger().info(f"deleted media '{mid}'")
+        self._respond(200, {"ok": True})
+
+    def do_DELETE(self):
+        parsed = urllib.parse.urlsplit(self.path)
+        route = parsed.path
+        if route.startswith("/api/media/"):
+            mid = route[len("/api/media/"):]
+            self._handle_delete(mid)
+            return
+        self._respond(405, {"error": "method not allowed"})
 
     def do_HEAD(self):
         parsed = urllib.parse.urlsplit(self.path)
