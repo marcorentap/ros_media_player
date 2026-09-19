@@ -64,6 +64,13 @@ class MediaPlayerBackend:
         self.data_dir = os.path.abspath(os.path.expanduser(data_dir))
         self.media_dir = os.path.join(self.data_dir, "media")
         os.makedirs(self.media_dir, exist_ok=True)
+        # Offline preprocessed (normalized) copies, one H.264 stream per
+        # (media, width, height, fps) cache key. Publishing decodes from these
+        # so the live path never re-encodes, and its native frame rate matches
+        # the publish rate 1:1 (see _Player).
+        self.preprocessed_dir = os.path.join(self.data_dir, "preprocessed")
+        os.makedirs(self.preprocessed_dir, exist_ok=True)
+        self._pp_locks: dict[str, threading.Lock] = {}
         self.db_path = os.path.join(self.data_dir, "media.db")
         self._init_db()
 
@@ -251,6 +258,13 @@ class MediaPlayerBackend:
             os.remove(os.path.join(self.media_dir, mid))
         except OSError:
             pass
+        # Drop any preprocessed (normalized) copies of this media too.
+        import glob
+        for p in glob.glob(os.path.join(self.preprocessed_dir, mid + "__*.mp4")):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         return True
 
     def name_exists(self, name: str) -> bool:
@@ -292,6 +306,104 @@ class MediaPlayerBackend:
                 (media_id, json.dumps(data)))
             conn.commit()
 
+    def _probe_video(self, path: str) -> dict:
+        """Return {width, height, fps} for a video file, or {} on failure."""
+        ffprobe = shutil.which("ffprobe") or "/usr/bin/ffprobe"
+        try:
+            out = subprocess.run(
+                [ffprobe, "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,avg_frame_rate",
+                 "-of", "json", path],
+                capture_output=True, timeout=30)
+        except Exception:
+            return {}
+        try:
+            s = json.loads(out.stdout)["streams"][0]
+        except (ValueError, KeyError, IndexError):
+            return {}
+        w = int(s.get("width") or 0)
+        h = int(s.get("height") or 0)
+        fps = 0.0
+        rate = s.get("avg_frame_rate")
+        if rate:
+            num, _, den = str(rate).partition("/")
+            try:
+                den = float(den) if den else 1.0
+                fps = float(num) / den if den else 0.0
+            except (TypeError, ValueError):
+                fps = 0.0
+        return {"width": w, "height": h, "fps": fps or 0.0}
+
+    def preprocess(self, media_id: str, base_path: str,
+                   width: int, height: int, fps: float) -> dict:
+        """Normalize a video off the request path into a cached H.264 stream
+        at the target publish size/fps, and return the file the player should
+        decode/publish from: {"path", "width", "height", "fps",
+        "preprocessed"}.
+
+        The cache key is derived from (media_id, size, fps), so visiting a
+        video or changing a publish setting re-triggers a rebuild without
+        touching the original. width/height == 0 keep natural size and
+        fps <= 0 keeps the source frame rate, so when those are unchanged the
+        original file is reused directly (nothing to gain from a duplicate
+        re-encode). Falls back to the original (live decode) when ffmpeg or a
+        probe is unavailable.
+        """
+        probe = self._probe_video(base_path)
+        natural_w = probe.get("width", 0)
+        natural_h = probe.get("height", 0)
+        native_fps = probe.get("fps", 0.0)
+        if not natural_w or not natural_h or not native_fps:
+            self.node.get_logger().warning(
+                f"could not probe '{media_id}' for preprocessing")
+            return {"path": base_path, "width": int(width), "height": int(height),
+                    "fps": float(fps), "preprocessed": False}
+        w = int(width or natural_w)
+        h = int(height or natural_h)
+        target_fps = max(1.0, float(fps)) if (fps and fps > 0) else native_fps
+        # Nothing to change: publishing from the original at native rate is
+        # already 1:1, so skip the pointless duplicate transcode.
+        if (w == natural_w and h == natural_h
+                and abs(target_fps - native_fps) < 1e-6):
+            return {"path": base_path, "width": w, "height": h,
+                    "fps": native_fps, "preprocessed": False}
+
+        key = f"{media_id}__{w}x{h}_{target_fps:.6g}.mp4"
+        dst = os.path.join(self.preprocessed_dir, key)
+        if os.path.isfile(dst):
+            return {"path": dst, "width": w, "height": h,
+                    "fps": target_fps, "preprocessed": True}
+
+        # Serialize builds per media so a background visit-trigger and a play
+        # racing in don't transcode+overwrite the same cache file together.
+        lock = self._pp_locks.setdefault(media_id, threading.Lock())
+        with lock:
+            if os.path.isfile(dst):  # someone finished while we waited
+                return {"path": dst, "width": w, "height": h,
+                        "fps": target_fps, "preprocessed": True}
+            ffmpeg = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+            try:
+                subprocess.run(
+                    [ffmpeg, "-y", "-v", "error", "-i", base_path,
+                     "-vf", f"scale={w}:{h},fps={target_fps}",
+                     "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
+                     dst],
+                    capture_output=True)
+            except Exception as exc:
+                self.node.get_logger().error(
+                    f"preprocess failed for '{media_id}': {exc}")
+                return {"path": base_path, "width": w, "height": h,
+                        "fps": target_fps, "preprocessed": False}
+            if not os.path.isfile(dst):
+                self.node.get_logger().error(
+                    f"preprocess produced no file for '{media_id}'")
+                return {"path": base_path, "width": w, "height": h,
+                        "fps": target_fps, "preprocessed": False}
+            self.node.get_logger().info(
+                f"preprocessed '{media_id}' -> {w}x{h}/{target_fps:.6g} fps")
+        return {"path": dst, "width": w, "height": h,
+                "fps": target_fps, "preprocessed": True}
+
 
 class _Player:
     """Backend-owned media cursor.
@@ -307,11 +419,11 @@ class _Player:
         self.b = backend
         self._lock = threading.Lock()
         self._proc = None
-        self._pump_thread = None
         self._reader_thread = None
         self._pacer_thread = None
         self._watchdog_thread = None
         self._frames = deque()
+        self._cv = None
         self._alive = False
         self._playing = False
         self._t = 0.0
@@ -342,22 +454,28 @@ class _Player:
                 proc.wait(timeout=3)
             except Exception:
                 pass
-        for t in (self._pump_thread, self._reader_thread, self._pacer_thread,
+        for t in (self._reader_thread, self._pacer_thread,
                   self._watchdog_thread):
             if (t is not None and t.is_alive()
                     and t is not threading.current_thread()):
                 t.join(timeout=2)
 
     def _decode_frame_at(self, path, t, width, height) -> bytes | None:
-        """One-shot decode of a single frame at time t into raw RGBA."""
-        with open(path, "rb") as f:
-            data = f.read()
+        """One-shot decode of a single frame at time t into raw RGBA.
+
+        Uses real-file input (not a stdin pipe) so ffmpeg can fast-seek to t
+        with ``-ss`` as an *input* option. Feeding the whole file via stdin
+        forced ffmpeg to decode forward from the start to reach t, which
+        fails partway through any stream with a damaged/truncated tail (the
+        "Error marking filters as finished / received no packets" crash).
+        """
         try:
             proc = subprocess.run(
-                [self._ffmpeg(), "-v", "error", "-i", "-", "-ss", str(t),
+                [self._ffmpeg(), "-v", "error",
+                 "-ss", str(t), "-i", path,
                  "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba",
                  "-s", f"{width}x{height}", "-"],
-                input=data, capture_output=True, timeout=30)
+                capture_output=True, timeout=30)
         except Exception as exc:
             self.b.node.get_logger().error(
                 f"frame decode at t={t} failed: {exc}")
@@ -392,39 +510,32 @@ class _Player:
 
     def _spawn_stream(self):
         ffmpeg = self._ffmpeg()
-        args = [ffmpeg, "-v", "error", "-i", "-", "-ss", str(self._t),
+        # The source is a real, seekable file (already normalized to the
+        # publish size/fps by offline preprocessing), so decode from the path
+        # and fast-seek to the cursor with an input ``-ss``. ffmpeg decodes way
+        # faster than wall-clock fps, so read_frames() throttles it via
+        # back-pressure (blocking on a full buffer) to keep production locked
+        # to pace()'s consumption; stdin piping is gone: a pipe has no index,
+        # so ffmpeg can't seek and dies on damaged stream tails.
+        args = [ffmpeg, "-v", "error",
+                "-ss", str(self._t), "-i", self._path,
                 "-f", "rawvideo", "-pix_fmt", "rgba",
                 "-s", f"{self._w}x{self._h}", "-"]
         self._proc = subprocess.Popen(
-            args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL)
         self._frames.clear()
         self._frame_bytes = self._w * self._h * 4
         self._alive = True
-
-        def pump():
-            try:
-                with open(self._path, "rb") as f:
-                    while True:
-                        chunk = f.read(1 << 20)
-                        if not chunk:
-                            break
-                        try:
-                            self._proc.stdin.write(chunk)
-                            self._proc.stdin.flush()
-                        except (BrokenPipeError, ValueError, OSError):
-                            break
-                try:
-                    self._proc.stdin.close()
-                except OSError:
-                    pass
-            except Exception:
-                pass
-        self._pump_thread = threading.Thread(target=pump, daemon=True)
-        self._pump_thread.start()
+        # Reader and pacer synchronize on this condition so the reader only
+        # fills the buffer up to its cap and then *blocks* (throttling ffmpeg
+        # via back-pressure on the pipe) instead of racing ahead to EOF and
+        # discarding frames the pacer hasn't consumed yet.
+        self._cv = threading.Condition(self._lock)
 
         def read_frames():
             n = self._frame_bytes
+            cap = int(self._fps * 2)
             while self._alive:
                 try:
                     raw = self._proc.stdout.read(n)
@@ -432,19 +543,27 @@ class _Player:
                     break
                 if not raw or len(raw) != n:
                     break
-                with self._lock:
-                    if len(self._frames) < int(self._fps * 2):
-                        self._frames.append(raw)
-                if not self._alive:
+                got = False
+                while not got:
+                    with self._cv:
+                        if not self._alive:
+                            break
+                        if len(self._frames) < cap:
+                            self._frames.append(raw)
+                            got = True
+                        else:
+                            self._cv.wait()  # full: wait for pace() to drain
+                if not got:
                     break
-            with self._lock:
+            with self._cv:
                 self._alive = False
+                self._cv.notify_all()
         self._reader_thread = threading.Thread(target=read_frames, daemon=True)
         self._reader_thread.start()
 
         def watchdog():
-            self._reader_thread.join(timeout=int(self._fps * 2))
-            with self._lock:
+            self._reader_thread.join(timeout=int(self._fps * 2) + 2)
+            with self._cv:
                 empty = not self._frames and self._alive
             if empty:
                 self.b.node.get_logger().error(
@@ -459,11 +578,19 @@ class _Player:
             period = 1.0 / self._fps
             while True:
                 time.sleep(period)
-                with self._lock:
-                    if not self._alive or not self._playing:
+                stop = False
+                with self._cv:
+                    if not self._playing:
                         return
                     self._t += period
-                    rgba = (self._frames.popleft() if self._frames else None)
+                    rgba = self._frames.popleft() if self._frames else None
+                    # EOF only ends the run once the buffered tail is drained.
+                    if rgba is None and not self._alive:
+                        stop = True
+                    if rgba is not None:
+                        self._cv.notify_all()  # made room for the reader
+                if stop:
+                    return
                 if rgba is not None:
                     self._publish_frame(rgba)
         self._pacer_thread = threading.Thread(target=pace, daemon=True)
@@ -726,6 +853,9 @@ class _Handler(BaseHTTPRequestHandler):
             out["topic"] = payload["topic"].strip()
         if isinstance(payload.get("frame_id"), str):
             out["frame_id"] = payload["frame_id"].strip()
+        if isinstance(payload.get("fps"), (int, float)):
+            fps = float(payload["fps"])
+            out["fps"] = fps if (fps > 0 and fps == fps) else 0
 
         # Capture the previously-stored markers BEFORE saving, so we can detect
         # and publish any newly-added point on the spot. This makes a marker
@@ -753,6 +883,97 @@ class _Handler(BaseHTTPRequestHandler):
             f"saved timeline for '{media_id}' ({len(clean)} tracks, "
             f"{sum(len(c['points']) for c in clean)} markers)")
         self._respond(200, {"ok": True})
+
+    def _handle_preprocess(self) -> None:
+        """Normalize a video for publishing and return the resolved stream.
+
+        Body (JSON): { media_id, width, height, fps }.
+        Blocks until the normalized stream is ready (a cache hit is fast; a
+        fresh transcode takes as long as it takes), then returns the url the
+        browser should play from — together with the size/fps that will be
+        published. The frontend holds playback behind a loading spinner until
+        this resolves, so the browser and ROS always play the same stream.
+        """
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._respond(400, {"error": "bad content-length"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self._respond(400, {"error": "expected JSON body"})
+            return
+        if not isinstance(payload, dict):
+            self._respond(400, {"error": "expected JSON object"})
+            return
+        media_id = payload.get("media_id")
+        rec = self.backend.get_media(media_id) if media_id else None
+        if rec is None:
+            self._respond(404, {"error": "media not found"})
+            return
+        path = os.path.join(self.backend.media_dir, media_id)
+        if not os.path.isfile(path):
+            self._respond(404, {"error": "media file missing"})
+            return
+        try:
+            width = int(payload.get("width") or 0)
+            height = int(payload.get("height") or 0)
+        except (TypeError, ValueError):
+            self._respond(400, {"error": "bad dimensions"})
+            return
+        try:
+            fps = float(payload.get("fps"))
+        except (TypeError, ValueError):
+            fps = 0.0
+
+        stream = self.backend.preprocess(media_id, path, width, height, fps)
+        if stream.get("preprocessed"):
+            url = "/media_pp/" + os.path.basename(stream["path"])
+        else:
+            url = "/media/" + urllib.parse.quote(media_id)
+        self._respond(200, {
+            "ready": True,
+            "preprocessed": bool(stream.get("preprocessed")),
+            "url": url,
+            "width": int(stream.get("width") or 0),
+            "height": int(stream.get("height") or 0),
+            "fps": float(stream.get("fps") or 0),
+        })
+
+    def _serve_preprocessed(self, name: str) -> None:
+        """Serve a normalized (preprocessed) stream by cache filename."""
+        name = os.path.basename(urllib.parse.unquote(name))
+        path = os.path.join(self.backend.preprocessed_dir, name)
+        if not name or not os.path.isfile(path):
+            self._respond(404, {"error": "not found"})
+            return
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            range_hdr = self.headers.get("Range")
+            if range_hdr and range_hdr.startswith("bytes="):
+                start_s, _, end_s = range_hdr[6:].partition("-")
+                start = int(start_s) if start_s else 0
+                end = int(end_s) if end_s else size - 1
+                start = max(0, min(start, size - 1))
+                end = max(start, min(end, size - 1))
+                length = end - start + 1
+                f.seek(start)
+                data = f.read(length)
+                self.send_response(206)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(data)
+            else:
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(size))
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                self.wfile.write(f.read())
 
     def _handle_control(self) -> None:
         """Accept a playback control from the browser and drive the backend
@@ -807,19 +1028,30 @@ class _Handler(BaseHTTPRequestHandler):
             tracks = []
         player = self.backend._player
 
+        # Publish from an offline-normalized copy when possible (cached fast,
+        # built once on visit/settings change; only transcodes on cache miss).
+        # Its native rate == publish rate, so live streaming is 1:1 and can't
+        # drain. Falls back to the original file when ffmpeg is unavailable.
+        stream = self.backend.preprocess(media_id, path, width, height, fps)
+        s_path, s_w, s_h, s_fps = (
+            stream["path"], stream["width"], stream["height"], stream["fps"])
+        src_note = " (preprocessed)" if stream.get("preprocessed") else " (source)"
+
         self.backend.node.get_logger().info(
             f"control cmd={cmd} media_id={media_id!r} t={t:.3f} "
             f"fps={fps} target={width if width else 'natural'}x"
             f"{height if height else 'natural'} topic={topic!r} "
-            f"frame_id={frame_id!r} tracks={len(tracks)}")
+            f"frame_id={frame_id!r} tracks={len(tracks)} "
+            f"stream={s_w if s_w else 'native'}x"
+            f"{s_h if s_h else 'native'}@{s_fps:.6g}fps{src_note}")
 
         if cmd == "play":
-            player.play(media_id, path, t, width, height, fps,
+            player.play(media_id, s_path, t, s_w, s_h, s_fps,
                         topic, frame_id, tracks)
             self._respond(200, {"ok": True, "cmd": "play", "t": t})
             return
         if cmd in ("pause", "stop", "scrub"):
-            player.set_frame(t, width, height)
+            player.set_frame(t, s_w, s_h)
             self._respond(200, {"ok": True, "cmd": cmd, "t": t})
             return
         self._respond(400, {"error": f"unknown cmd: {cmd}"})
@@ -847,6 +1079,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif route.startswith("/api/timeline/"):
             mid = urllib.parse.unquote(route[len("/api/timeline/"):])
             self._handle_timeline_get(mid)
+        elif route.startswith("/media_pp/"):
+            self._serve_preprocessed(route[len("/media_pp/"):])
         elif route.startswith("/media/"):
             self._serve_media(route[len("/media/"):])
         else:
@@ -898,6 +1132,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if route == "/publish/control":
             self._handle_control()
+            return
+
+        if route == "/api/preprocess":
+            self._handle_preprocess()
             return
 
         if route != "/publish":

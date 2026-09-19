@@ -928,9 +928,17 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
   const [playerTopic, setPlayerTopic] = useState('/media_player/image')
   const [playerFrameId, setPlayerFrameId] = useState('media_player')
+  // Desired publish FPS; 0 means "auto" (use the source video's measured rate).
+  const [playerFps, setPlayerFps] = useState(0)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [topicDraft, setTopicDraft] = useState('')
   const [frameIdDraft, setFrameIdDraft] = useState('')
+  const [fpsDraft, setFpsDraft] = useState('')
+  // The video may not play until it has been preprocessed (normalized) on the
+  // backend. While that's in flight we show a spinner and leave src empty;
+  // playSrc is set to the resolved stream url once ready.
+  const [processing, setProcessing] = useState(true)
+  const [playSrc, setPlaySrc] = useState<string | null>(null)
 
   // Frame duration, measured live via requestVideoFrameCallback so stepping
   // advances exactly one video frame (falls back to ~30fps before playback).
@@ -945,18 +953,29 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   topicRef.current = playerTopic
   const frameIdRef = useRef(playerFrameId)
   frameIdRef.current = playerFrameId
+  const fpsRef = useRef(playerFps)
+  fpsRef.current = playerFps
+  // Mirror of `processing` so the []-once key handler and other stale-closure
+  // callbacks can refuse playback until the stream is preprocessed.
+  const processingRef = useRef(processing)
+  processingRef.current = processing
 
-  // Persist the full timeline envelope { tracks, topic, frame_id } after every
-  // change. Each mutation passes the slice it just built plus the current
+  // Persist the full timeline envelope { tracks, topic, frame_id, fps } after
+  // every change. Each mutation passes the slice it just built plus the current
   // other fields (read from the mirror refs, since the mutation only touched
   // one slice). The image is a sensor_msgs/Image, so it's always stamped; only
   // the per-track stamped flags are toggleable.
   const saveTimeline = useCallback(
-    (next: TimelineTrack[], topic: string, frameId: string) => {
+    (next: TimelineTrack[], topic: string, frameId: string, fps: number) => {
       fetch(`/api/timeline/${encodeURIComponent(id)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tracks: next, topic, frame_id: frameId }),
+        body: JSON.stringify({
+          tracks: next,
+          topic,
+          frame_id: frameId,
+          fps,
+        }),
       }).catch(() => {})
     },
     [id],
@@ -983,6 +1002,9 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         if (typeof (body as { frame_id?: unknown })?.frame_id === 'string') {
           setPlayerFrameId((body as { frame_id?: string }).frame_id ?? 'media_player')
         }
+        if (typeof (body as { fps?: unknown })?.fps === 'number') {
+          setPlayerFps((body as { fps?: number }).fps ?? 0)
+        }
       })
       .catch(() => {
         if (!alive) return
@@ -997,12 +1019,13 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   // Persist the full timeline state after every change.
   // (saveTimeline is now the envelope saver defined above.)
 
-  // Set the player-level ROS topic + frame id and persist immediately.
+  // Set the player-level ROS topic + frame id + desired FPS and persist immediately.
   const changePlayerTopic = useCallback(
-    (topic: string, frameId: string) => {
+    (topic: string, frameId: string, fps: number) => {
       setPlayerTopic(topic)
       setPlayerFrameId(frameId)
-      saveTimeline(tracksRef.current ?? [], topic, frameId)
+      setPlayerFps(fps)
+      saveTimeline(tracksRef.current ?? [], topic, frameId, fps)
     },
     [saveTimeline],
   )
@@ -1013,7 +1036,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTracks((prev) => {
         if (!prev) return prev
         const next = prev.map((t) => (t.key === key ? { ...t, topic } : t))
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1026,7 +1049,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTracks((prev) => {
         if (!prev) return prev
         const next = prev.map((t) => (t.key === key ? { ...t, frameId } : t))
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1039,7 +1062,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTracks((prev) => {
         if (!prev) return prev
         const next = prev.map((t) => (t.key === key ? { ...t, stamped } : t))
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1051,13 +1074,17 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     if (settingsOpen) {
       setTopicDraft(playerTopic)
       setFrameIdDraft(playerFrameId)
+      setFpsDraft(playerFps > 0 ? String(playerFps) : '')
     }
-  }, [settingsOpen, playerTopic, playerFrameId])
+  }, [settingsOpen, playerTopic, playerFrameId, playerFps])
 
   const commitPlayerTopic = useCallback(() => {
-    changePlayerTopic(topicDraft.trim(), frameIdDraft.trim())
+    // Empty / non-numeric / non-positive means "auto" (use source video rate).
+    const parsed = Number(fpsDraft)
+    const fps = Number.isFinite(parsed) && parsed > 0 ? parsed : 0
+    changePlayerTopic(topicDraft.trim(), frameIdDraft.trim(), fps)
     setSettingsOpen(false)
-  }, [changePlayerTopic, topicDraft, frameIdDraft])
+  }, [changePlayerTopic, topicDraft, frameIdDraft, fpsDraft])
 
   // Send a playback control to the backend. The backend owns the decode + ROS
   // publish cursor; the browser only says "play/pause/stop/scrub at time t".
@@ -1065,7 +1092,11 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     const v = videoRef.current
     const w = v?.videoWidth ?? 0
     const h = v?.videoHeight ?? 0
-    const fps = frameDurRef.current ? Math.round(1 / frameDurRef.current) : 30
+    // Use the user-configured FPS when set; otherwise fall back to the source
+    // video's measured rate (or 30 before playback starts).
+    const fps = fpsRef.current > 0
+      ? fpsRef.current
+      : (frameDurRef.current ? Math.round(1 / frameDurRef.current) : 30)
     fetch('/publish/control', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1087,6 +1118,43 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   const sendControlRef = useRef(sendControl)
   sendControlRef.current = sendControl
 
+  // Preprocess the video into a normalized offline stream (size/fps) so ROS
+  // publishing never re-encodes in the live path. Fires on visit (mount) and
+  // again whenever the publish FPS setting changes (a new cache key). The
+  // browser is held back (spinner, no src) until this resolves so it plays the
+  // same normalized stream the backend publishes, not the raw original.
+  useEffect(() => {
+    let alive = true
+    setProcessing(true)
+    setPlaySrc(null)
+    fetch('/api/preprocess', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        media_id: id,
+        width: 0,
+        height: 0,
+        fps: fpsRef.current,
+      }),
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(String(r.status)))))
+      .then((body) => {
+        if (!alive) return
+        if (typeof body?.url === 'string') setPlaySrc(body.url)
+        else setPlaySrc(`/media/${encodeURIComponent(id)}`)
+        setProcessing(false)
+      })
+      .catch(() => {
+        // Preprocess unavailable (no ffmpeg/probe): fall back to the original.
+        if (!alive) return
+        setPlaySrc(`/media/${encodeURIComponent(id)}`)
+        setProcessing(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [id, playerFps])
+
   const addMarker = useCallback(
     (key: string, point: TimelinePoint) => {
       setTracks((prev) => {
@@ -1094,7 +1162,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         const next = prev.map((t) =>
           t.key === key ? { ...t, points: [...t.points, point] } : t,
         )
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1110,7 +1178,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
             ? { ...t, points: t.points.filter((p) => p !== point) }
             : t,
         )
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1130,7 +1198,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTracks((prev) => {
         if (!prev) return prev
         const next = prev.map((t) => (t.key === key ? { ...t, name } : t))
-        saveTimeline(next, topicRef.current, frameIdRef.current)
+        saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
         return next
       })
     },
@@ -1162,7 +1230,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     ]
     setTracks(next)
     setSelectedKey(key)
-    saveTimeline(next, topicRef.current, frameIdRef.current)
+    saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
   }, [tracks, selectedKey, saveTimeline])
 
   const removeTrack = useCallback(() => {
@@ -1174,7 +1242,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     const above = removedIndex > 0 ? next[removedIndex - 1] : null
     setTracks(next)
     setSelectedKey(above?.key ?? next[0]?.key ?? null)
-    saveTimeline(next, topicRef.current, frameIdRef.current)
+    saveTimeline(next, topicRef.current, frameIdRef.current, fpsRef.current)
   }, [tracks, selectedKey, saveTimeline])
 
   // Clicking the video drops a marker on the selected track at playhead time,
@@ -1233,6 +1301,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   }, [])
 
   const seek = useCallback((t: number) => {
+    if (processingRef.current) return
     const v = videoRef.current
     if (!v || !isFinite(t)) return
     v.currentTime = t
@@ -1241,6 +1310,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   }, [sendControl])
 
   const toggle = useCallback(() => {
+    if (processingRef.current) return
     const v = videoRef.current
     if (!v) return
     if (v.paused) {
@@ -1253,6 +1323,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   }, [sendControl])
 
   const stop = useCallback(() => {
+    if (processingRef.current) return
     const v = videoRef.current
     if (!v) return
     v.pause()
@@ -1306,6 +1377,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       const v = videoRef.current
       if (!v) return
       const key = (e as KeyboardEvent).key
+      if (processingRef.current) return
       if (key === ' ') {
         e.preventDefault()
         if (v.paused) {
@@ -1337,9 +1409,15 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   return (
     <>
       <div className="relative aspect-video mx-auto max-h-[420px] w-full max-w-[747px] overflow-hidden rounded-lg bg-black">
+        {processing && (
+          <div className="pointer-events-none absolute inset-0 z-30 flex flex-col items-center justify-center gap-2">
+            <div className="h-8 w-8 animate-spin rounded-full border-[3px] border-white/25 border-t-white" />
+            <span className="text-xs text-neutral-400">Preprocessing…</span>
+          </div>
+        )}
         <video
           ref={videoRef}
-          src={mediaUrl(id)}
+          src={playSrc ?? undefined}
           onClick={onVideoClick}
           className="h-full w-full cursor-crosshair object-contain"
           controls={false}
@@ -1484,6 +1562,22 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
                   else if (e.key === 'Escape') setSettingsOpen(false)
                 }}
                 placeholder="media_player"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+              />
+              <label className="mt-4 block text-[13px] font-medium text-neutral-300">
+                Publish FPS
+              </label>
+              <input
+                value={fpsDraft}
+                onChange={(e) => setFpsDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitPlayerTopic()
+                  else if (e.key === 'Escape') setSettingsOpen(false)
+                }}
+                type="number"
+                min="1"
+                step="1"
+                placeholder="auto (source rate)"
                 className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
               />
               <div className="mt-5 flex justify-end gap-2">
