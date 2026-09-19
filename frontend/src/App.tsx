@@ -460,7 +460,7 @@ function TrackRowHeading({
           >
             <div className="w-full max-w-sm rounded-xl border border-white/10 bg-[#0e1116] p-5 shadow-2xl">
               <div className="mb-4 flex items-center justify-between">
-                <h2 className="text-sm font-semibold">Track settings</h2>
+                <h2 className="text-sm font-semibold">Track Settings</h2>
                 <button
                   onClick={() => setOpen(false)}
                   aria-label="Close"
@@ -469,17 +469,8 @@ function TrackRowHeading({
                   <X size={16} />
                 </button>
               </div>
-              <div className="mb-4 flex items-center gap-2">
-                <span
-                  className="h-3 w-3 shrink-0 rounded-full"
-                  style={{ background: track.color }}
-                />
-                <span className="text-xs text-neutral-400">
-                  {track.points.length} marker{track.points.length === 1 ? '' : 's'}
-                </span>
-              </div>
-              <label className="block text-[11px] uppercase tracking-wider text-neutral-500">
-                Track name
+              <label className="block text-[13px] font-medium text-neutral-300">
+                Name
               </label>
               <input
                 ref={inputRef}
@@ -489,7 +480,7 @@ function TrackRowHeading({
                   if (e.key === 'Enter') commit()
                   else if (e.key === 'Escape') setOpen(false)
                 }}
-                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-sm text-white outline-none focus:border-blue-500"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
               />
               <div className="mt-5 flex justify-end gap-2">
                 <button
