@@ -19,8 +19,6 @@ import {
   Repeat,
   Settings2,
   Square,
-  StepBack,
-  StepForward,
   Trash2,
   Upload,
   X,
@@ -260,7 +258,7 @@ function formatTime(t: number): string {
   const h = Math.floor(totalS / 3600)
   const m = Math.floor((totalS % 3600) / 60)
   const s = totalS % 60
-  return `${h}:${m.toString().padStart(2, '0')}:${s
+  return `${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s
     .toString()
     .padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
 }
@@ -1096,15 +1094,6 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     return () => cancelAnimationFrame(raf)
   }, [])
 
-  const stepFrame = useCallback((dir: 1 | -1) => {
-    const v = videoRef.current
-    if (!v || !isFinite(v.duration)) return
-    if (!v.paused) v.pause()
-    const target = Math.min(v.duration, Math.max(0, v.currentTime + dir * frameDurRef.current))
-    v.currentTime = target
-    setCurrent(target)
-  }, [])
-
   // Arrow keys step by one frame. Held repeats are throttled to ~15fps (one
   // step every 67ms; key auto-repeat fires ~every 30ms, faster than the
   // decoder can render a seek). Queueing up multiple coalesced seeks is what
@@ -1182,20 +1171,14 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
           ))}
       </div>
 
-      <div className="mt-3 flex items-center justify-center gap-1 text-xs tabular-nums text-neutral-400">
-        <span>{formatTime(current)}</span>
-        <span>/</span>
-        <span>{formatTime(duration)}</span>
-      </div>
-
-      <div className="mt-2 flex items-center justify-center gap-2.5">
+      <div className="mx-auto mt-2 flex w-full max-w-[747px] items-center justify-between gap-2.5">
+        <div className="flex items-center gap-2.5">
         <button
-          onClick={() => stepFrame(-1)}
-          aria-label="Step back one frame"
-          title="Step back one frame"
-          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-white/10 text-neutral-300 transition-colors hover:bg-white/15 hover:text-white"
+          onClick={toggle}
+          aria-label={playing ? 'Pause' : 'Play'}
+          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-blue-600 text-white transition-colors hover:bg-blue-500"
         >
-          <StepBack size={14} />
+          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
         </button>
         <button
           onClick={stop}
@@ -1204,13 +1187,6 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
           className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-white/10 text-neutral-300 transition-colors hover:bg-white/15 hover:text-white"
         >
           <Square size={11} fill="currentColor" />
-        </button>
-        <button
-          onClick={toggle}
-          aria-label={playing ? 'Pause' : 'Play'}
-          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-blue-600 text-white transition-colors hover:bg-blue-500"
-        >
-          {playing ? <Pause size={14} /> : <Play size={14} className="ml-0.5" />}
         </button>
         <button
           onClick={() => setLoop((l) => !l)}
@@ -1225,14 +1201,10 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         >
           <Repeat size={14} />
         </button>
-        <button
-          onClick={() => stepFrame(1)}
-          aria-label="Step forward one frame"
-          title="Step forward one frame"
-          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-white/10 text-neutral-300 transition-colors hover:bg-white/15 hover:text-white"
-        >
-          <StepForward size={14} />
-        </button>
+        </div>
+        <span className="text-xs tabular-nums text-neutral-400">
+          {formatTime(current)}/{formatTime(duration)}
+        </span>
       </div>
 
       <Timeline
