@@ -8,17 +8,23 @@ framework.  In development the Vite dev server proxies ``/api`` and
 ``/media`` here, giving live reload while the page still talks to ROS over
 HTTP.
 
-The node keeps a media gallery in ``<data_dir>/media``.  The browser can
-list it (``GET /api/media``), upload pictures/videos to it
+The node keeps a media gallery in ``<data_dir>/media``.  Files are stored
+internally under a UUID name (``<data_dir>/media/<uuid>``) with their display
+name and MIME type kept in a SQLite database (``<data_dir>/media.db``).  The
+browser can list it (``GET /api/media``), upload pictures/videos to it
 (``POST /api/media``, multipart/form-data) and fetch the files back
-(``GET /media/<name>``).
+(``GET /media/<id>``).
 """
 
 import json
 import mimetypes
 import os
+import sqlite3
 import threading
+import uuid
 import urllib.parse
+from contextlib import closing
+from datetime import datetime, timezone
 from email import message_from_bytes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -32,10 +38,6 @@ from std_msgs.msg import String
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".avi", ".ogg"}
 ALLOWED_EXTS = IMAGE_EXTS | VIDEO_EXTS
-
-
-def media_kind(name: str) -> str:
-    return "video" if os.path.splitext(name)[1].lower() in VIDEO_EXTS else "image"
 
 
 class MediaPlayerBackend:
@@ -53,6 +55,8 @@ class MediaPlayerBackend:
         self.data_dir = os.path.abspath(os.path.expanduser(data_dir))
         self.media_dir = os.path.join(self.data_dir, "media")
         os.makedirs(self.media_dir, exist_ok=True)
+        self.db_path = os.path.join(self.data_dir, "media.db")
+        self._init_db()
 
         self.node = rclpy.create_node("media_player")
         # QoS: reliable + transient local so the publisher can be created
@@ -92,6 +96,74 @@ class MediaPlayerBackend:
         # Closure binds the backend so the handler can publish at request time.
         return _Handler(self, request, client_address, server)
 
+    # --- media store (SQLite metadata + UUID files) ------------------------
+
+    def _db(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self) -> None:
+        with closing(self._db()) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS media (
+                    id         TEXT PRIMARY KEY,
+                    name       TEXT NOT NULL,
+                    mime       TEXT NOT NULL,
+                    size       INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            # Display names stay unique so the gallery reads like a list of
+            # real files even though the backing files are UUIDs.
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_media_name ON media(name)")
+            conn.commit()
+
+    def list_media(self) -> list[dict]:
+        with closing(self._db()) as conn:
+            rows = conn.execute(
+                "SELECT id, name, mime, size FROM media ORDER BY created_at ASC"
+            ).fetchall()
+        return [{
+            "id": row["id"],
+            "name": row["name"],
+            "mime": row["mime"],
+            "size": row["size"],
+            "kind": "video" if row["mime"].lower().startswith("video/") else "image",
+        } for row in rows]
+
+    def get_media(self, mid: str):
+        with closing(self._db()) as conn:
+            return conn.execute(
+                "SELECT id, name, mime, size FROM media WHERE id = ?", (mid,)
+            ).fetchone()
+
+    def add_media(self, mid: str, name: str, mime: str, size: int) -> None:
+        with closing(self._db()) as conn:
+            conn.execute(
+                "INSERT INTO media (id, name, mime, size, created_at) "
+                "VALUES (?,?,?,?,?)",
+                (mid, name, mime, size,
+                 datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+
+    def name_exists(self, name: str) -> bool:
+        with closing(self._db()) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM media WHERE name = ?", (name,)).fetchone()
+        return row is not None
+
+    def unique_name(self, name: str) -> str:
+        """Return a display name not yet in use (basename-1.ext, ...)."""
+        if not self.name_exists(name):
+            return name
+        stem, ext = os.path.splitext(name)
+        n = 1
+        while self.name_exists(f"{stem}-{n}{ext}"):
+            n += 1
+        return f"{stem}-{n}{ext}"
+
 
 class _Handler(BaseHTTPRequestHandler):
     """Minimal JSON + media HTTP handler for the media player backend."""
@@ -113,41 +185,21 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _safe_media_name(self, name: str) -> str | None:
-        """Return a sanitized basename if the file exists under media_dir."""
-        base = os.path.basename(urllib.parse.unquote(name))
-        if base in ("", ".", ".."):
-            return None
-        path = os.path.join(self.backend.media_dir, base)
-        if os.path.isfile(path):
-            return base
-        return None
-
     def _list_media(self) -> list[dict]:
-        items = []
-        for name in sorted(os.listdir(self.backend.media_dir)):
-            path = os.path.join(self.backend.media_dir, name)
-            if not os.path.isfile(path):
-                continue
-            try:
-                size = os.path.getsize(path)
-            except OSError:
-                size = 0
-            items.append({
-                "name": name,
-                "size": size,
-                "kind": media_kind(name),
-            })
-        return items
+        return self.backend.list_media()
 
-    def _serve_media(self, name: str, head_only: bool = False) -> None:
-        base = self._safe_media_name(name)
-        if base is None:
+    def _serve_media(self, mid: str, head_only: bool = False) -> None:
+        mid = urllib.parse.unquote(mid)
+        rec = self.backend.get_media(mid)
+        if rec is None:
             self._respond(404, {"error": "not found"})
             return
-        path = os.path.join(self.backend.media_dir, base)
-        ctype = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        size = os.path.getsize(path)
+        path = os.path.join(self.backend.media_dir, mid)
+        if not os.path.isfile(path):
+            self._respond(404, {"error": "not found"})
+            return
+        ctype = rec["mime"] or "application/octet-stream"
+        size = rec["size"] or os.path.getsize(path)
 
         with open(path, "rb") as f:
             range_hdr = self.headers.get("Range")
@@ -214,26 +266,18 @@ class _Handler(BaseHTTPRequestHandler):
             if data is None:
                 rejected.append({"name": filename, "reason": "empty body"})
                 continue
-            target = self._unique_path(os.path.basename(filename))
+            mid = str(uuid.uuid4())
+            target = os.path.join(self.backend.media_dir, mid)
             with open(target, "wb") as f:
                 f.write(data)
-            saved.append(os.path.basename(target))
+            display = self.backend.unique_name(os.path.basename(filename))
+            mime = mimetypes.guess_type(display)[0] or "application/octet-stream"
+            self.backend.add_media(mid, display, mime, len(data))
+            saved.append({"id": mid, "name": display})
             self.backend.node.get_logger().info(
-                f"saved media '{os.path.basename(target)}' "
-                f"({len(data)} bytes)")
+                f"saved media '{display}' ({mid}, {len(data)} bytes)")
 
         self._respond(201, {"saved": saved, "rejected": rejected})
-
-    def _unique_path(self, filename: str) -> str:
-        """Return a non-colliding path under media_dir for `filename`."""
-        base, ext = os.path.splitext(filename)
-        candidate = os.path.join(self.backend.media_dir, filename)
-        n = 1
-        while os.path.exists(candidate):
-            candidate = os.path.join(
-                self.backend.media_dir, f"{base}-{n}{ext}")
-            n += 1
-        return candidate
 
     # --- routes ------------------------------------------------------------
 

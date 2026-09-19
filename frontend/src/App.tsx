@@ -2,7 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Upload } from 'lucide-react'
 
 type MediaItem = {
+  id: string
   name: string
+  mime: string
   size: number
   kind: 'image' | 'video'
 }
@@ -14,8 +16,8 @@ function isAllowed(name: string): boolean {
   return IMAGE_RE.test(name) || VIDEO_RE.test(name)
 }
 
-function mediaUrl(name: string): string {
-  return `/media/${encodeURIComponent(name)}`
+function mediaUrl(id: string): string {
+  return `/media/${id}`
 }
 
 let dragDepth = 0
@@ -154,11 +156,11 @@ export default function App() {
 
         {items.map((item) => (
           <figure
-            key={item.name}
+            key={item.id}
             className="relative m-0"
           >
             <a
-              href={mediaUrl(item.name)}
+              href={mediaUrl(item.id)}
               target="_blank"
               rel="noopener noreferrer"
               className="block"
@@ -167,7 +169,7 @@ export default function App() {
               <div className="aspect-video cursor-pointer overflow-hidden rounded-md bg-(--thumb-bg)">
                 {item.kind === 'video' ? (
                   <video
-                    src={mediaUrl(item.name)}
+                    src={mediaUrl(item.id)}
                     muted
                     preload="metadata"
                     draggable={false}
@@ -175,7 +177,7 @@ export default function App() {
                   />
                 ) : (
                   <img
-                    src={mediaUrl(item.name)}
+                    src={mediaUrl(item.id)}
                     alt={item.name}
                     loading="lazy"
                     draggable={false}
