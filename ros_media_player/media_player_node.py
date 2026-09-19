@@ -12,8 +12,8 @@ The node keeps a media gallery in ``<data_dir>/media``.  Files are stored
 internally under a UUID name (``<data_dir>/media/<uuid>``) with their display
 name and MIME type kept in a SQLite database (``<data_dir>/media.db``).  The
 browser can list it (``GET /api/media``), upload pictures/videos to it
-(``POST /api/media``, multipart/form-data) and fetch the files back
-(``GET /media/<id>``).
+(``POST /api/media``, multipart/form-data), fetch the files back
+(``GET /media/<id>``) and rename them (``POST /api/media/rename``).
 """
 
 import json
@@ -148,6 +148,13 @@ class MediaPlayerBackend:
                  datetime.now(timezone.utc).isoformat()))
             conn.commit()
 
+    def rename_media(self, mid: str, new_name: str) -> bool:
+        with closing(self._db()) as conn:
+            cur = conn.execute(
+                "UPDATE media SET name = ? WHERE id = ?", (new_name, mid))
+            conn.commit()
+            return cur.rowcount > 0
+
     def name_exists(self, name: str) -> bool:
         with closing(self._db()) as conn:
             row = conn.execute(
@@ -279,6 +286,50 @@ class _Handler(BaseHTTPRequestHandler):
 
         self._respond(201, {"saved": saved, "rejected": rejected})
 
+    def _handle_rename(self) -> None:
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            self._respond(400, {"error": "bad content-length"})
+            return
+        try:
+            payload = json.loads(self.rfile.read(length))
+        except (ValueError, json.JSONDecodeError):
+            self._respond(400, {"error": "expected JSON body"})
+            return
+
+        mid = payload.get("id") if isinstance(payload, dict) else None
+        new_name = payload.get("newName") if isinstance(payload, dict) else None
+        if not mid or not new_name:
+            self._respond(400, {"error": "'id' and 'newName' required"})
+            return
+
+        if self.backend.get_media(mid) is None:
+            self._respond(404, {"error": "not found"})
+            return
+
+        new = os.path.basename(urllib.parse.unquote(new_name)).strip()
+        if new in ("", ".", ".."):
+            self._respond(400, {"error": "invalid name"})
+            return
+        ext = os.path.splitext(new)[1].lower()
+        if ext not in ALLOWED_EXTS:
+            self._respond(400, {
+                "error": "new name must keep a supported extension"})
+            return
+        if self.backend.name_exists(new):
+            self._respond(409, {"error": "a file with that name already exists"})
+            return
+
+        try:
+            self.backend.rename_media(mid, new)
+        except sqlite3.IntegrityError:
+            self._respond(409, {"error": "a file with that name already exists"})
+            return
+        self.backend.node.get_logger().info(
+            f"renamed media '{mid}' -> '{new}'")
+        self._respond(200, {"id": mid, "name": new})
+
     # --- routes ------------------------------------------------------------
 
     def do_GET(self):
@@ -319,6 +370,10 @@ class _Handler(BaseHTTPRequestHandler):
 
         if route == "/api/media":
             self._handle_upload()
+            return
+
+        if route == "/api/media/rename":
+            self._handle_rename()
             return
 
         if route != "/publish":
