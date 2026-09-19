@@ -276,6 +276,9 @@ type TimelineTrack = {
   key: string
   name: string
   color: string
+  topic: string
+  frameId: string
+  stamped: boolean
   points: TimelinePoint[]
 }
 
@@ -313,8 +316,7 @@ const TRACK_COLOR_DARKEN_PER_CYCLE = 0.28 // darkening multiplier per full wrap 
 // Hardcoded track set for now. Names/colors persist once renamed on a given
 // media item; a fresh media item falls back to these defaults.
 const DEFAULT_TRACKS: TimelineTrack[] = [
-  { key: 'a', name: 'Object 1', color: TRACK_COLORS[0], points: [] },
-  { key: 'b', name: 'Object 2', color: TRACK_COLORS[1], points: [] },
+  { key: 'a', name: 'Object 1', color: TRACK_COLORS[0], topic: '/media_player/click', frameId: 'media_player', stamped: true, points: [] },
 ]
 
 function darkenHex(hex: string, amount: number): string {
@@ -378,22 +380,34 @@ function TrackRowHeading({
   selected,
   onSelect,
   onRename,
+  onTopic,
+  onFrameId,
+  onStamped,
 }: {
   track: TimelineTrack
   selected: boolean
   onSelect: () => void
   onRename: (name: string) => void
+  onTopic: (topic: string) => void
+  onFrameId: (frameId: string) => void
+  onStamped: (stamped: boolean) => void
 }) {
   const [open, setOpen] = useState(false)
   const [draft, setDraft] = useState(track.name)
+  const [topicDraft, setTopicDraft] = useState(track.topic)
+  const [frameIdDraft, setFrameIdDraft] = useState(track.frameId)
+  const [stampedDraft, setStampedDraft] = useState(track.stamped)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
     if (!open) return
     setDraft(track.name)
+    setTopicDraft(track.topic)
+    setFrameIdDraft(track.frameId)
+    setStampedDraft(track.stamped)
     const t = setTimeout(() => inputRef.current?.focus(), 0)
     return () => clearTimeout(t)
-  }, [open, track.name])
+  }, [open, track.name, track.topic, track.frameId, track.stamped])
 
   // Close on Escape while the dialog is open.
   useEffect(() => {
@@ -409,6 +423,11 @@ function TrackRowHeading({
     e?.preventDefault()
     const next = draft.trim()
     if (next && next !== track.name) onRename(next)
+    const t = topicDraft.trim()
+    if (t !== track.topic) onTopic(t)
+    const f = frameIdDraft.trim()
+    if (f !== track.frameId) onFrameId(f)
+    if (stampedDraft !== track.stamped) onStamped(stampedDraft)
     setOpen(false)
   }
 
@@ -481,6 +500,44 @@ function TrackRowHeading({
                 }}
                 className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
               />
+              <label className="mt-4 block text-[13px] font-medium text-neutral-300">
+                ROS topic
+              </label>
+              <input
+                value={topicDraft}
+                onChange={(e) => setTopicDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commit()
+                  else if (e.key === 'Escape') setOpen(false)
+                }}
+                placeholder="/media_player/click"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+              />
+              <label className="mt-4 block text-[13px] font-medium text-neutral-300">
+                Frame ID
+              </label>
+              <input
+                value={frameIdDraft}
+                onChange={(e) => setFrameIdDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commit()
+                  else if (e.key === 'Escape') setOpen(false)
+                }}
+                placeholder="media_player"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+              />
+              <div className="mt-4 flex items-center justify-between">
+                <label className="text-[13px] font-medium text-neutral-300">Stamped</label>
+                <button
+                  role="switch"
+                  aria-checked={stampedDraft}
+                  aria-label="Stamped"
+                  onClick={() => setStampedDraft((s) => !s)}
+                  className={`relative h-5 w-9 shrink-0 cursor-pointer rounded-full transition-colors ${stampedDraft ? 'bg-blue-600' : 'bg-white/15'}`}
+                >
+                  <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${stampedDraft ? 'left-[18px]' : 'left-0.5'}`} />
+                </button>
+              </div>
               <div className="mt-5 flex justify-end gap-2">
                 <button
                   onClick={() => setOpen(false)}
@@ -513,6 +570,9 @@ type TimelineProps = {
   onSeek: (t: number) => void
   onSelectTrack: (key: string) => void
   onRenameTrack: (key: string, name: string) => void
+  onTopicTrack: (key: string, topic: string) => void
+  onFrameIdTrack: (key: string, frameId: string) => void
+  onStampedTrack: (key: string, stamped: boolean) => void
   onAddTrack: () => void
   onRemoveTrack: () => void
 }
@@ -527,6 +587,9 @@ function Timeline({
   onSeek,
   onSelectTrack,
   onRenameTrack,
+  onTopicTrack,
+  onFrameIdTrack,
+  onStampedTrack,
   onAddTrack,
   onRemoveTrack,
 }: TimelineProps) {
@@ -729,6 +792,9 @@ function Timeline({
               selected={t.key === selectedKey}
               onSelect={() => onSelectTrack(t.key)}
               onRename={(name) => onRenameTrack(t.key, name)}
+              onTopic={(topic) => onTopicTrack(t.key, topic)}
+              onFrameId={(frameId) => onFrameIdTrack(t.key, frameId)}
+              onStamped={(stamped) => onStampedTrack(t.key, stamped)}
             />
           ))}
         </div>
@@ -860,6 +926,36 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   const [loop, setLoop] = useState(false)
   const [tracks, setTracks] = useState<TimelineTrack[] | null>(null)
   const [selectedKey, setSelectedKey] = useState<string | null>(null)
+  const [playerTopic, setPlayerTopic] = useState('/media_player/image')
+  const [playerFrameId, setPlayerFrameId] = useState('media_player')
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [topicDraft, setTopicDraft] = useState('')
+  const [frameIdDraft, setFrameIdDraft] = useState('')
+
+  // Mirror refs so envelope saves (which fire from callbacks with stale
+  // closures) always persist the complete state, never clobber one field.
+  const tracksRef = useRef<TimelineTrack[] | null>(tracks)
+  tracksRef.current = tracks
+  const topicRef = useRef(playerTopic)
+  topicRef.current = playerTopic
+  const frameIdRef = useRef(playerFrameId)
+  frameIdRef.current = playerFrameId
+
+  // Persist the full timeline envelope { tracks, topic, frame_id } after every
+  // change. Each mutation passes the slice it just built plus the current
+  // other fields (read from the mirror refs, since the mutation only touched
+  // one slice). The image is a sensor_msgs/Image, so it's always stamped; only
+  // the per-track stamped flags are toggleable.
+  const saveTimeline = useCallback(
+    (next: TimelineTrack[], topic: string, frameId: string) => {
+      fetch(`/api/timeline/${encodeURIComponent(id)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tracks: next, topic, frame_id: frameId }),
+      }).catch(() => {})
+    },
+    [id],
+  )
 
   // Load persisted timeline state for this media item.
   useEffect(() => {
@@ -876,6 +972,12 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
           : DEFAULT_TRACKS
         setTracks(stored)
         setSelectedKey((prev) => prev ?? stored[0]?.key ?? null)
+        if (typeof (body as { topic?: unknown })?.topic === 'string') {
+          setPlayerTopic((body as { topic?: string }).topic ?? '')
+        }
+        if (typeof (body as { frame_id?: unknown })?.frame_id === 'string') {
+          setPlayerFrameId((body as { frame_id?: string }).frame_id ?? 'media_player')
+        }
       })
       .catch(() => {
         if (!alive) return
@@ -888,17 +990,69 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   }, [id])
 
   // Persist the full timeline state after every change.
-  const saveTimeline = useCallback(
-    (next: TimelineTrack[]) => {
-      fetch(`/api/timeline/${encodeURIComponent(id)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tracks: next }),
-      }).catch(() => {})
+  // (saveTimeline is now the envelope saver defined above.)
+
+  // Set the player-level ROS topic + frame id and persist immediately.
+  const changePlayerTopic = useCallback(
+    (topic: string, frameId: string) => {
+      setPlayerTopic(topic)
+      setPlayerFrameId(frameId)
+      saveTimeline(tracksRef.current ?? [], topic, frameId)
     },
-    [id],
+    [saveTimeline],
   )
 
+  // Set a single track's ROS topic and persist.
+  const changeTrackTopic = useCallback(
+    (key: string, topic: string) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) => (t.key === key ? { ...t, topic } : t))
+        saveTimeline(next, topicRef.current, frameIdRef.current)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
+  // Set a single track's frame id and persist.
+  const changeTrackFrameId = useCallback(
+    (key: string, frameId: string) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) => (t.key === key ? { ...t, frameId } : t))
+        saveTimeline(next, topicRef.current, frameIdRef.current)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
+  // Set a single track's stamped flag and persist.
+  const changeTrackStamped = useCallback(
+    (key: string, stamped: boolean) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) => (t.key === key ? { ...t, stamped } : t))
+        saveTimeline(next, topicRef.current, frameIdRef.current)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
+  // Sync the settings dialog drafts whenever it opens / values change.
+  useEffect(() => {
+    if (settingsOpen) {
+      setTopicDraft(playerTopic)
+      setFrameIdDraft(playerFrameId)
+    }
+  }, [settingsOpen, playerTopic, playerFrameId])
+
+  const commitPlayerTopic = useCallback(() => {
+    changePlayerTopic(topicDraft.trim(), frameIdDraft.trim())
+    setSettingsOpen(false)
+  }, [changePlayerTopic, topicDraft, frameIdDraft])
   const addMarker = useCallback(
     (key: string, point: TimelinePoint) => {
       setTracks((prev) => {
@@ -906,7 +1060,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         const next = prev.map((t) =>
           t.key === key ? { ...t, points: [...t.points, point] } : t,
         )
-        saveTimeline(next)
+        saveTimeline(next, topicRef.current, frameIdRef.current)
         return next
       })
     },
@@ -922,7 +1076,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
             ? { ...t, points: t.points.filter((p) => p !== point) }
             : t,
         )
-        saveTimeline(next)
+        saveTimeline(next, topicRef.current, frameIdRef.current)
         return next
       })
     },
@@ -942,7 +1096,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       setTracks((prev) => {
         if (!prev) return prev
         const next = prev.map((t) => (t.key === key ? { ...t, name } : t))
-        saveTimeline(next)
+        saveTimeline(next, topicRef.current, frameIdRef.current)
         return next
       })
     },
@@ -962,6 +1116,9 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       key,
       name: `Track ${tracks.length + 1}`,
       color: trackColor(tracks.length),
+      topic: '/media_player/click',
+      frameId: 'media_player',
+      stamped: true,
       points: [],
     }
     const next: TimelineTrack[] = [
@@ -971,7 +1128,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     ]
     setTracks(next)
     setSelectedKey(key)
-    saveTimeline(next)
+    saveTimeline(next, topicRef.current, frameIdRef.current)
   }, [tracks, selectedKey, saveTimeline])
 
   const removeTrack = useCallback(() => {
@@ -983,7 +1140,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
     const above = removedIndex > 0 ? next[removedIndex - 1] : null
     setTracks(next)
     setSelectedKey(above?.key ?? next[0]?.key ?? null)
-    saveTimeline(next)
+    saveTimeline(next, topicRef.current, frameIdRef.current)
   }, [tracks, selectedKey, saveTimeline])
 
   // Clicking the video drops a marker on the selected track at playhead time,
@@ -1201,6 +1358,14 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         >
           <Repeat size={14} />
         </button>
+        <button
+          onClick={() => setSettingsOpen(true)}
+          aria-label="Settings"
+          title="Settings"
+          className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full bg-white/10 text-neutral-300 transition-colors hover:bg-white/15 hover:text-white"
+        >
+          <Settings2 size={14} />
+        </button>
         </div>
         <span className="text-xs tabular-nums text-neutral-400">
           {formatTime(current)}/{formatTime(duration)}
@@ -1217,9 +1382,79 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         onSeek={seek}
         onSelectTrack={selectTrack}
         onRenameTrack={renameTrack}
+        onTopicTrack={changeTrackTopic}
+        onFrameIdTrack={changeTrackFrameId}
+        onStampedTrack={changeTrackStamped}
         onAddTrack={addTrack}
         onRemoveTrack={removeTrack}
       />
+
+      {settingsOpen &&
+        createPortal(
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4 backdrop-blur-sm"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setSettingsOpen(false)
+            }}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Video settings"
+          >
+            <div className="w-full max-w-sm rounded-xl border border-white/10 bg-[#0e1116] p-5 shadow-2xl">
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="text-sm font-semibold">Video Settings</h2>
+                <button
+                  onClick={() => setSettingsOpen(false)}
+                  aria-label="Close"
+                  className="cursor-pointer rounded-md p-1 text-neutral-500 transition-colors hover:bg-white/10 hover:text-white"
+                >
+                  <X size={16} />
+                </button>
+              </div>
+              <label className="block text-[13px] font-medium text-neutral-300">
+                Image output
+              </label>
+              <input
+                value={topicDraft}
+                onChange={(e) => setTopicDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitPlayerTopic()
+                  else if (e.key === 'Escape') setSettingsOpen(false)
+                }}
+                placeholder="/media_player/image"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+              />
+              <label className="mt-4 block text-[13px] font-medium text-neutral-300">
+                Frame ID
+              </label>
+              <input
+                value={frameIdDraft}
+                onChange={(e) => setFrameIdDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') commitPlayerTopic()
+                  else if (e.key === 'Escape') setSettingsOpen(false)
+                }}
+                placeholder="media_player"
+                className="mt-1.5 w-full rounded-md border border-white/15 bg-white/5 px-3 py-2 text-xs text-white outline-none focus:border-blue-500"
+              />
+              <div className="mt-5 flex justify-end gap-2">
+                <button
+                  onClick={() => setSettingsOpen(false)}
+                  className="cursor-pointer rounded-md px-3 py-1.5 text-sm text-neutral-300 transition-colors hover:bg-white/10"
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={commitPlayerTopic}
+                  className="cursor-pointer rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white transition-colors hover:bg-blue-500"
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
     </>
   )
 }
