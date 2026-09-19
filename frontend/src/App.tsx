@@ -336,16 +336,6 @@ function trackColor(index: number): string {
     : darkenHex(base, Math.min(cycle, 3) * TRACK_COLOR_DARKEN_PER_CYCLE)
 }
 
-// Merge the default track set into whatever a media item persisted, appending
-// any default tracks that aren't already present (matched by key). This lets
-// new default tracks surface on already-saved items instead of only on fresh
-// ones.
-function withDefaultTracks(saved: TimelineTrack[]): TimelineTrack[] {
-  const present = new Set(saved.map((t) => t.key))
-  const missing = DEFAULT_TRACKS.filter((d) => !present.has(d.key))
-  return missing.length ? [...saved, ...missing] : saved
-}
-
 const LANE_H = 32 // px height shared by every lane row for column alignment
 const RULER_H = 18 // px height of the time ruler above the lanes
 
@@ -889,9 +879,11 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
       .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
       .then((body) => {
         if (!alive) return
+        // Default tracks only apply to new media (nothing persisted yet). Once
+        // a media item has any saved timeline, use exactly what it persisted.
         const stored = Array.isArray(body?.tracks) && body.tracks.length
-          ? withDefaultTracks(body.tracks)
-          : withDefaultTracks(DEFAULT_TRACKS)
+          ? body.tracks
+          : DEFAULT_TRACKS
         setTracks(stored)
         setSelectedKey((prev) => prev ?? stored[0]?.key ?? null)
       })
