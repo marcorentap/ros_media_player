@@ -280,28 +280,43 @@ type TimelineTrack = {
   points: TimelinePoint[]
 }
 
+// Kelly's "Twenty-Two Colors of Maximum Contrast" (Kelly, 1965), as published
+// and implemented by the R `Polychrome` package. The full 22-color set includes
+// Black (#222222) and White (#f2f3f4); both are dropped here (per the request),
+// leaving the 20 chromatic colors in Kelly's original optimal-contrast ordering.
+// With 20 entries the cycles rarely wrap, but when they do each full cycle
+// (`cycle` >= 1) darkens the color toward black to keep repeats identifiable
+// against the dark timeline background.
+const TRACK_COLORS = [
+  '#f3c300', // Vivid Yellow
+  '#875692', // Strong Purple
+  '#f38400', // Vivid Orange
+  '#a1caf1', // Very Light Blue
+  '#be0032', // Vivid Red
+  '#c2b280', // Grayish Yellow
+  '#848482', // Medium Gray
+  '#008856', // Vivid Green
+  '#e68fac', // Strong Purplish Pink
+  '#0067a5', // Strong Blue
+  '#f99379', // Strong Yellowish Pink
+  '#604e97', // Strong Violet
+  '#f6a600', // Vivid Orange Yellow
+  '#b3446c', // Strong Purplish Red
+  '#dcd300', // Vivid Greenish Yellow
+  '#882d17', // Strong Reddish Brown
+  '#8db600', // Vivid Yellowish Green
+  '#654522', // Deep Yellowish Brown
+  '#e25822', // Vivid Reddish Orange
+  '#2b3d26', // Strong Olive Green
+]
+const TRACK_COLOR_DARKEN_PER_CYCLE = 0.28 // darkening multiplier per full wrap (capped)
+
 // Hardcoded track set for now. Names/colors persist once renamed on a given
 // media item; a fresh media item falls back to these defaults.
 const DEFAULT_TRACKS: TimelineTrack[] = [
-  { key: 'a', name: 'Object 1', color: '#f87171', points: [] },
-  { key: 'b', name: 'Object 2', color: '#38bdf8', points: [] },
+  { key: 'a', name: 'Object 1', color: TRACK_COLORS[0], points: [] },
+  { key: 'b', name: 'Object 2', color: TRACK_COLORS[1], points: [] },
 ]
-
-// Okabe-Ito palette: engineered to be maximally distinct and colorblind-safe
-// (deuteranopia/protanopia/tritanopia). With only 8 entries it wraps, so each
-// full cycle (`cycle` >= 1) darkens the color toward black to keep repeats
-// identifiable against the dark timeline background.
-const TRACK_COLORS = [
-  '#000000',
-  '#e69f00',
-  '#56b4e9',
-  '#009e73',
-  '#f0e442',
-  '#0072b2',
-  '#d55e00',
-  '#cc79a7',
-]
-const TRACK_COLOR_DARKEN_PER_CYCLE = 0.28 // darkening multiplier per full wrap (capped)
 
 function darkenHex(hex: string, amount: number): string {
   const n = parseInt(hex.slice(1), 16)
@@ -311,8 +326,8 @@ function darkenHex(hex: string, amount: number): string {
   return '#' + [r, g, b].map((c) => c.toString(16).padStart(2, '0')).join('')
 }
 
-// Color for the track at the given ordinal: base Okabe-Ito entry, darkened on
-// each palette wrap so repeats stay distinguishable.
+// Color for the track at the given ordinal: base Kelly palette entry, darkened
+// on each palette wrap so repeats stay distinguishable.
 function trackColor(index: number): string {
   const base = TRACK_COLORS[index % TRACK_COLORS.length]
   const cycle = Math.floor(index / TRACK_COLORS.length)
