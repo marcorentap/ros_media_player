@@ -726,6 +726,28 @@ class _Handler(BaseHTTPRequestHandler):
             out["topic"] = payload["topic"].strip()
         if isinstance(payload.get("frame_id"), str):
             out["frame_id"] = payload["frame_id"].strip()
+
+        # Capture the previously-stored markers BEFORE saving, so we can detect
+        # and publish any newly-added point on the spot. This makes a marker
+        # dropped by clicking the video publish immediately, not only when the
+        # cursor later crosses its timestamp during playback/scrubbing.
+        old = self.backend.get_timeline(media_id) or {}
+        old_marks = set()
+
+        for tr in (old.get("tracks") or []) if isinstance(old.get("tracks"), list) else []:
+            for p in tr.get("points") or []:
+                if isinstance(p, dict):
+                    old_marks.add((tr.get("key"), p.get("t"), p.get("x"), p.get("y")))
+        for tr in clean:
+            for p in tr.get("points") or []:
+                mark = (tr["key"], p["t"], p["x"], p["y"])
+                if mark in old_marks:
+                    continue
+                old_marks.add(mark)
+                topic = tr.get("topic") or payload.get("topic") or "/media_player/image"
+                frame_id = tr.get("frameId") or payload.get("frame_id") or "media_player"
+                self.backend.publish_point(topic, frame_id,
+                                           p["x"], p["y"], tr.get("stamped", True))
         self.backend.save_timeline(media_id, out)
         self.backend.node.get_logger().info(
             f"saved timeline for '{media_id}' ({len(clean)} tracks, "
