@@ -247,9 +247,14 @@ function Gallery() {
 
 function formatTime(t: number): string {
   if (!isFinite(t) || t < 0) t = 0
-  const m = Math.floor(t / 60)
-  const s = Math.floor(t % 60)
-  return `${m}:${s.toString().padStart(2, '0')}`
+  const ms = Math.floor((t % 1) * 1000)
+  const totalS = Math.floor(t)
+  const h = Math.floor(totalS / 3600)
+  const m = Math.floor((totalS % 3600) / 60)
+  const s = totalS % 60
+  return `${h}:${m.toString().padStart(2, '0')}:${s
+    .toString()
+    .padStart(2, '0')}.${ms.toString().padStart(3, '0')}`
 }
 
 type ScrubberProps = {
@@ -275,9 +280,6 @@ function Scrubber({ current, duration, buffered, onSeek }: ScrubberProps) {
 
   return (
     <div className="flex w-full items-center gap-3">
-      <span className="w-12 shrink-0 text-right text-xs tabular-nums text-neutral-400">
-        {formatTime(shown)}
-      </span>
       <div
         ref={trackRef}
         className="group relative h-1.5 flex-1 cursor-pointer rounded-full bg-white/10"
@@ -314,9 +316,6 @@ function Scrubber({ current, duration, buffered, onSeek }: ScrubberProps) {
           style={{ left: `calc(${ratio(shown) * 100}% - 7px)` }}
         />
       </div>
-      <span className="w-12 shrink-0 text-xs tabular-nums text-neutral-400">
-        {formatTime(duration)}
-      </span>
     </div>
   )
 }
@@ -410,6 +409,21 @@ function VideoPlayer({ id }: { id: string }) {
     }
   }, [])
 
+  // Keep the time display live. The native `timeupdate` event only fires a few
+  // times per second, which is too coarse to render milliseconds, so tick the
+  // current time from the video element on each animation frame while playing.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!v) return
+    let raf = 0
+    const tick = () => {
+      if (!v.paused) setCurrent(v.currentTime)
+      raf = requestAnimationFrame(tick)
+    }
+    raf = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(raf)
+  }, [])
+
   const stepFrame = useCallback((dir: 1 | -1) => {
     const v = videoRef.current
     if (!v || !isFinite(v.duration)) return
@@ -448,6 +462,12 @@ function VideoPlayer({ id }: { id: string }) {
           onClick={toggle}
           playsInline
         />
+      </div>
+
+      <div className="mt-3 flex items-center justify-center gap-1 text-xs tabular-nums text-neutral-400">
+        <span>{formatTime(current)}</span>
+        <span>/</span>
+        <span>{formatTime(duration)}</span>
       </div>
 
       <div className="mt-3 flex items-center justify-center gap-2.5">
