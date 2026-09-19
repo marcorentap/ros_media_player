@@ -394,6 +394,7 @@ function VideoPlayer({ id }: { id: string }) {
   // Frame duration, measured live via requestVideoFrameCallback so stepping
   // advances exactly one video frame (falls back to ~30fps before playback).
   const frameDurRef = useRef(1 / 30)
+  const lastStepRef = useRef(0)
   useEffect(() => {
     const v = videoRef.current
     if (!v || typeof (v as HTMLVideoElement).requestVideoFrameCallback !== 'function') return
@@ -433,18 +434,30 @@ function VideoPlayer({ id }: { id: string }) {
     setCurrent(target)
   }, [])
 
-  // Arrow keys to seek ±5s.
+  // Arrow keys step by one frame. Held repeats are throttled to ~15fps (one
+  // step every 67ms; key auto-repeat fires ~every 30ms, faster than the
+  // decoder can render a seek). Queueing up multiple coalesced seeks is what
+  // inflated the live frameDur measurement and made later steps jump seconds.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const v = videoRef.current
       if (!v) return
       const key = (e as KeyboardEvent).key
-      if (key === 'ArrowRight') {
+      if (key === ' ') {
         e.preventDefault()
-        v.currentTime = Math.min(v.duration || 0, v.currentTime + 5)
-      } else if (key === 'ArrowLeft') {
+        if (v.paused) v.play().catch(() => {})
+        else v.pause()
+      } else if (key === 'ArrowRight' || key === 'ArrowLeft') {
         e.preventDefault()
-        v.currentTime = Math.max(0, v.currentTime - 5)
+        const dir = key === 'ArrowRight' ? 1 : -1
+        const now = performance.now()
+        // Throttle held repeating to ~15fps (one step every 67ms) instead of
+        // queueing every auto-repeat seek faster than the decoder can render.
+        if (now - lastStepRef.current < 1000 / 15) return
+        lastStepRef.current = now
+        if (!v.paused) v.pause()
+        const t = v.currentTime + dir * frameDurRef.current
+        v.currentTime = dir === 1 ? Math.min(v.duration || 0, t) : Math.max(0, t)
       }
     }
     window.addEventListener('keydown', onKey)
@@ -459,7 +472,6 @@ function VideoPlayer({ id }: { id: string }) {
           src={mediaUrl(id)}
           className="h-full w-full object-contain"
           controls={false}
-          onClick={toggle}
           playsInline
         />
       </div>
