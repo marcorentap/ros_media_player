@@ -916,6 +916,22 @@ function VideoPlayer({ id }: { id: string }) {
     [saveTimeline],
   )
 
+  const removeMarker = useCallback(
+    (key: string, point: TimelinePoint) => {
+      setTracks((prev) => {
+        if (!prev) return prev
+        const next = prev.map((t) =>
+          t.key === key
+            ? { ...t, points: t.points.filter((p) => p !== point) }
+            : t,
+        )
+        saveTimeline(next)
+        return next
+      })
+    },
+    [saveTimeline],
+  )
+
   const selectTrack = useCallback((key: string) => setSelectedKey(key), [])
 
   const renameTrack = useCallback(
@@ -1127,7 +1143,7 @@ function VideoPlayer({ id }: { id: string }) {
         />
         {tracks && selectedKey && tracks.length > 0 && (
           <div className="pointer-events-none absolute left-2 top-2 rounded bg-black/50 px-2 py-0.5 text-[10px] text-neutral-300">
-            Click to mark on{' '}
+            Click to add or remove markers on{' '}
             <span
               className="font-medium"
               style={{ color: tracks.find((t) => t.key === selectedKey)?.color }}
@@ -1136,18 +1152,23 @@ function VideoPlayer({ id }: { id: string }) {
             </span>
           </div>
         )}
-        {/* overlay dots flashing on the video as the playhead passes each marker */}
+        {/* overlay dots flashing on the video as the playhead passes each marker; clicking one removes it */}
         {(tracks ?? [])
           .flatMap((t) =>
             t.points
               .filter((p) => Math.abs(current - p.t) <= 0.05)
-              .map((p) => ({ ...p, color: t.color })),
+              .map((p) => ({ point: p, trackKey: t.key, color: t.color })),
           )
           .map((m, i) => (
             <div
-              key={i}
-              className="pointer-events-none absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full ring-2 ring-black/60"
-              style={{ left: `${m.x * 100}%`, top: `${m.y * 100}%`, background: m.color }}
+              key={m.point.t + ':' + m.point.x + ':' + m.point.y + ':' + i}
+              title="Remove marker"
+              className="pointer-events-auto absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full ring-2 ring-black/60 transition-transform hover:scale-125 hover:brightness-125"
+              style={{ left: `${m.point.x * 100}%`, top: `${m.point.y * 100}%`, background: m.color }}
+              onClick={(e) => {
+                e.stopPropagation()
+                removeMarker(m.trackKey, m.point)
+              }}
             />
           ))}
       </div>
