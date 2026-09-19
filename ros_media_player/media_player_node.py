@@ -312,11 +312,6 @@ class _Handler(BaseHTTPRequestHandler):
         if new in ("", ".", ".."):
             self._respond(400, {"error": "invalid name"})
             return
-        ext = os.path.splitext(new)[1].lower()
-        if ext not in ALLOWED_EXTS:
-            self._respond(400, {
-                "error": "new name must keep a supported extension"})
-            return
         if self.backend.name_exists(new):
             self._respond(409, {"error": "a file with that name already exists"})
             return
