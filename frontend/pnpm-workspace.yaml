@@ -1,0 +1,3 @@
+# Allow esbuild to run its postinstall (needed by Vite).
+allowBuilds:
+  esbuild: true
