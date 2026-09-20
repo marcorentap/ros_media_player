@@ -45,6 +45,12 @@ export function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal
   // advances exactly one video frame (falls back to ~30fps before playback).
   const frameDurRef = useRef(1 / 30)
   const lastStepRef = useRef(0)
+  // Debounce state for scrub publishing. Dragging the timeline fires a burst
+  // of onSeek calls; each backend scrub is a one-shot decode+publish, so we
+  // coalesce them to a single command once the burst settles instead of
+  // hammering the backend on every pointer move.
+  const scrubTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const scrubPendingRef = useRef<number | null>(null)
 
   // The size/fps of the stream the backend resolved via /api/preprocess. This
   // is the single authority for the width/height/fps we tell the backend to
@@ -397,6 +403,7 @@ export function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal
     v.addEventListener('progress', onProgress)
     v.addEventListener('ended', onEnded)
     return () => {
+      if (scrubTimerRef.current) clearTimeout(scrubTimerRef.current)
       v.removeEventListener('timeupdate', onTime)
       v.removeEventListener('durationchange', onDur)
       v.removeEventListener('play', onPlay)
@@ -416,7 +423,17 @@ export function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal
       v.pause()
       v.currentTime = t
       setCurrent(t)
-      send('scrub', t)
+      // Coalesce the backend scrub: remember the latest time and fire a single
+      // command once the burst of seeks settles, then a trailing one after the
+      // last seek so the exact landing position is always published.
+      scrubPendingRef.current = t
+      if (scrubTimerRef.current) clearTimeout(scrubTimerRef.current)
+      scrubTimerRef.current = setTimeout(() => {
+        const te = scrubPendingRef.current
+        if (te == null) return
+        scrubPendingRef.current = null
+        send('scrub', te)
+      }, 90)
     },
     [send],
   )
