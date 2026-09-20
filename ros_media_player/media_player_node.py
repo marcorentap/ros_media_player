@@ -19,6 +19,7 @@ the same database, readable via ``GET /api/timeline/<id>`` and saved with
 ``POST /api/timeline/<id>``.
 """
 
+import cv2
 import json
 import mimetypes
 import os
@@ -27,10 +28,8 @@ import math
 import sqlite3
 import subprocess
 import threading
-import time
 import uuid
 import urllib.parse
-from collections import deque
 from contextlib import closing
 from datetime import datetime, timezone
 from email import message_from_bytes
@@ -146,8 +145,11 @@ class MediaPlayerBackend:
         msg.step = int(width) * (4 if encoding == "rgba8" else 3)
         msg.data = data
         self._img_pub(topic).publish(msg)
-        self.node.get_logger().info(
-            f"published image [{encoding} {width}x{height}] on '{topic}'")
+        # Skip per-frame logging while a stream is running (Play can publish
+        # at 30+ fps; the hot path must not pay for log formatting each frame).
+        if not self._player._playing:
+            self.node.get_logger().info(
+                f"published image [{encoding} {width}x{height}] on '{topic}'")
 
     def publish_point(self, topic: str, frame_id: str,
                       x: float, y: float, stamped: bool) -> None:
@@ -167,9 +169,11 @@ class MediaPlayerBackend:
             msg.y = float(y)
             msg.z = 0.0
             self._plain_pub(topic).publish(msg)
-        self.node.get_logger().info(
-            f"published {'PointStamped' if stamped else 'Point'} ({x:.4f},{y:.4f}) "
-            f"on '{topic}'")
+        # Skip per-point logging during an active stream (see publish_image).
+        if not self._player._playing:
+            self.node.get_logger().info(
+                f"published {'PointStamped' if stamped else 'Point'} "
+                f"({x:.4f},{y:.4f}) on '{topic}'")
 
     def shutdown(self) -> None:
         self.executor.shutdown()
@@ -407,31 +411,31 @@ class MediaPlayerBackend:
 
 
 class _Player:
-    """Backend-owned media cursor.
+    """Backend-owned media cursor with the fake_input decode hot path.
 
     The browser never sends pixels; it only sends controls (play/pause/stop
-    at a time). This player decodes the media file inside this process and
-    publishes frames plus the lane points the cursor passes as it runs its own
-    wall-clock clock. Media bytes are fed to ffmpeg via stdin because the
-    snap-installed ffmpeg on this box cannot open dot-prefixed ~/.ros paths.
+    at a media-time). This player decodes the media file inside this process
+    and publishes frames plus the lane points the cursor passes on its own
+    wall-clock clock. Decoding follows the object-sensing fake_input design:
+    one persistent forward ``VideoCapture`` (read() ~ms/frame; seek only when
+    a request is out of order), stills decoded once and cached per file mtime,
+    and playback paced by a single ROS drain timer (one frame per tick on the
+    executor's spin thread) instead of ffmpeg subprocesses, a reader thread, a
+    pacer thread, and a watchdog. The ffmpeg machinery still runs *off-path*
+    in preprocess() to normalize a video to the publish size/fps; the hot path
+    only decodes that already-prepared file.
     """
 
     def __init__(self, backend):
         self.b = backend
         self._lock = threading.Lock()
-        self._proc = None
-        self._reader_thread = None
-        self._pacer_thread = None
-        self._watchdog_thread = None
-        self._frames = deque()
-        self._cv = None
-        self._alive = False
         self._playing = False
         self._t = 0.0
         # A playback action ("pause"/"stop"/"scrub") requested while the
         # cursor was still behind its target media-time. It is completed by
-        # pace() once self._t reaches the target, instead of snapping the
-        # cursor forward immediately. Tuple (cmd, target_t) or None.
+        # _on_drain once self._t reaches the target, instead of snapping the
+        # cursor forward immediately.
+        # Tuple (cmd, target_t, width, height, topic, frame_id) or None.
         self._deferred = None
         self._media_id = None
         self._path = None
@@ -441,64 +445,103 @@ class _Player:
         self._topic = "/media_player/image"
         self._frame_id = "media_player"
         self._tracks = []
+        # Persistent forward decoder (video): one open VideoCapture keyed by
+        # (path, mtime), reading forward and seeking only when out of order.
+        self._cap = None
+        self._cap_key = None
+        self._next_frame = 0
+        # Cached still pixels (image): RGBA bytes keyed by (path, mtime), so a
+        # still is decoded exactly once and the per-publish hot path just
+        # copies the bytes into the Image message (mirrors fake_input._still_rgb).
+        self._still_key = None
+        self._still_bytes = None
+        # Single drain timer paces Play streaming at the configured fps; created
+        # once at node setup (like fake_input) and retuned on each play.
+        self._timer = self.b.node.create_timer(1.0 / 30.0, self._on_drain)
 
-    def _ffmpeg(self):
-        return shutil.which("ffmpeg") or "/snap/bin/ffmpeg"
+    # -- decode -------------------------------------------------------------
 
-    def _stop(self):
-        with self._lock:
-            self._playing = False
-            self._alive = False
-            # Any pending deferred action is moot once the stream is stopped:
-            # a play/stop/restart cancels a lagging catch-up.
-            self._deferred = None
-            proc = self._proc
-            self._proc = None
-        if proc is not None:
-            try:
-                proc.kill()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=3)
-            except Exception:
-                pass
-        for t in (self._reader_thread, self._pacer_thread,
-                  self._watchdog_thread):
-            if (t is not None and t.is_alive()
-                    and t is not threading.current_thread()):
-                t.join(timeout=2)
+    def _is_video_path(self) -> bool:
+        return os.path.splitext(self._path)[1].lower() in VIDEO_EXTS
 
-    def _decode_frame_at(self, path, t, width, height) -> bytes | None:
-        """One-shot decode of a single frame at time t into raw RGBA.
+    def _release_decoder(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+        self._cap = None
+        self._cap_key = None
+        self._next_frame = 0
+        self._still_key = None
+        self._still_bytes = None
 
-        Uses real-file input (not a stdin pipe) so ffmpeg can fast-seek to t
-        with ``-ss`` as an *input* option. Feeding the whole file via stdin
-        forced ffmpeg to decode forward from the start to reach t, which
-        fails partway through any stream with a damaged/truncated tail (the
-        "Error marking filters as finished / received no packets" crash).
-        """
+    def _decode_video_frame(self, frame_no: int):
+        """BGR frame of the current video at 0-based ``frame_no``, using one
+        persistent VideoCapture read forward (a few ms/frame) and seeking only
+        for an out-of-order request, mirroring fake_input._decode_stream. A
+        changed file (mtime) reopens the capture. Called while holding
+        self._lock so the ROS tick and an HTTP-triggered seek never race."""
         try:
-            proc = subprocess.run(
-                [self._ffmpeg(), "-v", "error",
-                 "-ss", str(t), "-i", path,
-                 "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgba",
-                 "-s", f"{width}x{height}", "-"],
-                capture_output=True, timeout=30)
-        except Exception as exc:
-            self.b.node.get_logger().error(
-                f"frame decode at t={t} failed: {exc}")
+            mtime = os.path.getmtime(self._path)
+        except OSError:
             return None
-        need = width * height * 4
-        if proc.returncode != 0 or len(proc.stdout) != need:
-            err = (proc.stderr or b"").decode("utf-8", "replace").strip()
-            lines = err.splitlines()
-            detail = "\n".join(f"  {l}" for l in lines[-3:]) if lines else ""
-            self.b.node.get_logger().error(
-                f"frame decode at t={t} got {len(proc.stdout)}/{need} bytes "
-                f"(rc={proc.returncode}){(':\n' + detail) if detail else ''}")
+        key = (self._path, mtime)
+        if self._cap_key != key:
+            if self._cap is not None:
+                self._cap.release()
+            self._cap = cv2.VideoCapture(self._path)
+            if self._cap is None or not self._cap.isOpened():
+                self._cap = None
+                self._cap_key = None
+                return None
+            self._cap_key = key
+            self._next_frame = 0
+        if frame_no == self._next_frame:
+            ok, bgr = self._cap.read()
+            if ok:
+                self._next_frame += 1
+                return bgr
+            # EOF mid-stream: drop the cursor and bail.
+            self._cap.release()
+            self._cap = None
+            self._cap_key = None
             return None
-        return proc.stdout
+        if self._cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no):
+            ok, bgr = self._cap.read()
+            if ok:
+                self._next_frame = frame_no + 1
+                return bgr
+        self._cap.release()
+        self._cap = None
+        self._cap_key = None
+        return None
+
+    def _still_rgba(self) -> bytes | None:
+        """Decoded RGBA bytes of the current still image, decoded once and
+        cached per file mtime (mirroring fake_input._still_rgb). A still's
+        pixels never change after normalization, so the file decode is off the
+        per-publish hot path; the on-line cost is only the byte copy."""
+        try:
+            mtime = os.path.getmtime(self._path)
+        except OSError:
+            return None
+        key = (self._path, mtime)
+        if self._still_key == key and self._still_bytes is not None:
+            return self._still_bytes
+        img = cv2.imread(self._path, cv2.IMREAD_COLOR)
+        if img is None:
+            return None
+        rgba = cv2.cvtColor(img, cv2.COLOR_BGR2RGBA)
+        self._still_key = key
+        self._still_bytes = rgba.tobytes()
+        return self._still_bytes
+
+    def _decode_frame(self, t: float) -> bytes | None:
+        """RGBA bytes of the frame at media-time ``t`` of the current media."""
+        if self._is_video_path():
+            bgr = self._decode_video_frame(int(round(t * self._fps)))
+            if bgr is None:
+                return None
+            return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGBA).tobytes()
+        return self._still_rgba()
 
     def _points_at(self, t):
         hits = []
@@ -510,111 +553,49 @@ class _Player:
                                  p.get("x", 0.5), p.get("y", 0.5)))
         return hits
 
-    def _publish_frame(self, rgba):
+    def _publish_frame(self, rgba: bytes) -> None:
         self.b.publish_image(self._topic, self._frame_id,
                              self._w, self._h, "rgba8", rgba)
         for topic, fid, stamped, x, y in self._points_at(self._t):
             self.b.publish_point(topic or self._topic, fid or self._frame_id,
                                  x, y, stamped)
 
-    def _spawn_stream(self):
-        ffmpeg = self._ffmpeg()
-        # The source is a real, seekable file (already normalized to the
-        # publish size/fps by offline preprocessing), so decode from the path
-        # and fast-seek to the cursor with an input ``-ss``. ffmpeg decodes way
-        # faster than wall-clock fps, so read_frames() throttles it via
-        # back-pressure (blocking on a full buffer) to keep production locked
-        # to pace()'s consumption; stdin piping is gone: a pipe has no index,
-        # so ffmpeg can't seek and dies on damaged stream tails.
-        args = [ffmpeg, "-v", "error",
-                "-ss", str(self._t), "-i", self._path,
-                "-f", "rawvideo", "-pix_fmt", "rgba",
-                "-s", f"{self._w}x{self._h}", "-"]
-        self._proc = subprocess.Popen(
-            args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL)
-        self._frames.clear()
-        self._frame_bytes = self._w * self._h * 4
-        self._alive = True
-        # Reader and pacer synchronize on this condition so the reader only
-        # fills the buffer up to its cap and then *blocks* (throttling ffmpeg
-        # via back-pressure on the pipe) instead of racing ahead to EOF and
-        # discarding frames the pacer hasn't consumed yet.
-        self._cv = threading.Condition(self._lock)
+    # -- pacing: ROS drain timer, runs on the executor's spin thread ----------
 
-        def read_frames():
-            n = self._frame_bytes
-            cap = int(self._fps * 2)
-            while self._alive:
-                try:
-                    raw = self._proc.stdout.read(n)
-                except Exception:
-                    break
-                if not raw or len(raw) != n:
-                    break
-                got = False
-                while not got:
-                    with self._cv:
-                        if not self._alive:
-                            break
-                        if len(self._frames) < cap:
-                            self._frames.append(raw)
-                            got = True
-                        else:
-                            self._cv.wait()  # full: wait for pace() to drain
-                if not got:
-                    break
-            with self._cv:
-                self._alive = False
-                self._cv.notify_all()
-        self._reader_thread = threading.Thread(target=read_frames, daemon=True)
-        self._reader_thread.start()
+    def _on_drain(self) -> None:
+        """One pacing tick of playback, at 1/fps. Runs on the executor's spin
+        thread, so rclpy publish calls are safe. Each tick advances the cursor
+        and publishes one frame; an EOF ends the run once reached. fake_input
+        drains at most one queued publish per tick; here the browser sends a
+        single play command so Play emits a frame on every tick."""
+        with self._lock:
+            if not self._playing:
+                self._release_decoder()  # drop decoder resources while idle
+                return
+            self._t += 1.0 / self._fps
+            rgba = self._decode_frame(self._t)
+            stop = rgba is None  # EOF
+        if rgba is not None:
+            self._publish_frame(rgba)
+        if stop:
+            self._stop()
+            return
+        with self._lock:
+            deferred = self._deferred
+            reached = deferred is not None and self._t >= deferred[1]
+            if reached:
+                self._deferred = None
+        if reached:
+            dcmd, dt, dw, dh = deferred
+            self._apply_action(dcmd, dt, dw, dh)
 
-        def watchdog():
-            self._reader_thread.join(timeout=int(self._fps * 2) + 2)
-            with self._cv:
-                empty = not self._frames and self._alive
-            if empty:
-                self.b.node.get_logger().error(
-                    "play stream produced no frames — check the ffmpeg "
-                    "codec / media file")
-                with self._lock:
-                    self._alive = False
-        self._watchdog_thread = threading.Thread(target=watchdog, daemon=True)
-        self._watchdog_thread.start()
+    def _stop(self) -> None:
+        with self._lock:
+            self._playing = False
+            self._deferred = None
+            self._release_decoder()
 
-        def pace():
-            period = 1.0 / self._fps
-            while True:
-                time.sleep(period)
-                stop = False
-                with self._cv:
-                    if not self._playing:
-                        return
-                    self._t += period
-                    rgba = self._frames.popleft() if self._frames else None
-                    # EOF only ends the run once the buffered tail is drained.
-                    if rgba is None and not self._alive:
-                        stop = True
-                    if rgba is not None:
-                        self._cv.notify_all()  # made room for the reader
-                if stop:
-                    return
-                if rgba is not None:
-                    self._publish_frame(rgba)
-                # Complete a deferred action once the cursor reaches its
-                # target media-time (the frame at that time was just
-                # published), so pause/stop/scrub apply exactly at that point.
-                with self._lock:
-                    deferred = self._deferred
-                    reached = deferred is not None and self._t >= deferred[1]
-                if reached:
-                    dcmd, dt, dw, dh = self._deferred
-                    self._deferred = None
-                    self._apply_action(dcmd, dt, dw, dh)
-                    return
-        self._pacer_thread = threading.Thread(target=pace, daemon=True)
-        self._pacer_thread.start()
+    # -- public API (called from the HTTP server threads) ----------------------
 
     def play(self, media_id, path, t, width, height, fps,
              topic, frame_id, tracks):
@@ -629,9 +610,11 @@ class _Player:
             self._topic = topic
             self._frame_id = frame_id
             self._tracks = tracks
-        self._spawn_stream()
-        with self._lock:
             self._playing = True
+        # Retune the single drain timer to the new frame rate; the next tick
+        # decodes from the start point (the first tick seeks the decoder).
+        if self._timer is not None:
+            self._timer.timer_period_ns = int((1.0 / self._fps) * 1e9)
 
     def queue_action(self, cmd, t, width, height):
         """Queue a pause/stop/scrub with deferred semantics.
@@ -639,7 +622,7 @@ class _Player:
         The frontend issues these relative to its own timeline. If a play
         stream is currently running and the cursor is still *behind* the
         requested media-time, keep streaming (publishing every frame) and only
-        apply the action once pace() reaches ``t``. If the cursor is already
+        apply the action once _on_drain reaches ``t``. If the cursor is already
         at/on the far side of ``t`` -- or not streaming at all -- apply it
         immediately. This way the node acts at that point in the media, never
         by snapping forward past frames it hasn't reached yet.
@@ -647,8 +630,6 @@ class _Player:
         with self._lock:
             lagging = self._playing and self._t < t
             if lagging:
-                # Write under the lock so pace() can't read a half-set tuple
-                # between the `lagging` check and this store.
                 self._deferred = (cmd, t, width, height)
                 return
         self._apply_action(cmd, t, width, height)
@@ -657,15 +638,15 @@ class _Player:
         """Paused update for pause/stop/scrub: stop the stream and publish the
         single frame at ``t`` (with the cursor left there)."""
         self._stop()
+        rgba = None
         with self._lock:
             self._t = max(0.0, float(t))
             if width:
                 self._w = int(width)
             if height:
                 self._h = int(height)
-        rgba = None
-        if self._path:
-            rgba = self._decode_frame_at(self._path, self._t, self._w, self._h)
+            if self._path:
+                rgba = self._decode_frame(self._t)
         if rgba:
             self._publish_frame(rgba)
 
