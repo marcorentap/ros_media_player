@@ -631,6 +631,7 @@ class Action:
     t: float
     width: int = 0
     height: int = 0
+    fps: float = 0.0
     topic: str | None = None
     frame_id: str | None = None
     is_video: bool | None = None
@@ -708,11 +709,11 @@ class Player(threading.Thread):
                          float(fps), topic, frame_id, tracks or [], bool(loop),
                          bool(is_video)))
 
-    def action(self, cmd, t, width, height, topic=None, frame_id=None,
-               is_video=None) -> None:
+    def action(self, cmd, t, width, height, fps=0.0, topic=None,
+               frame_id=None, is_video=None) -> None:
         """Queue a scrub/pause/stop acting at media-time ``t`` (see dispatch)."""
         self._q.put(Action(cmd, float(t), int(width or 0), int(height or 0),
-                           topic, frame_id, is_video))
+                           max(0.0, float(fps)), topic, frame_id, is_video))
 
     def publish_point(self, topic, frame_id, x, y, stamped) -> None:
         """Publish a single lane-track point (used by timeline marker saves)."""
@@ -829,6 +830,8 @@ class Player(threading.Thread):
             self._w = int(act.width)
         if act.height:
             self._h = int(act.height)
+        if act.fps:
+            self._fps = max(1.0, float(act.fps))
         if act.topic:
             self._topic = act.topic
         if act.frame_id:
@@ -1363,9 +1366,11 @@ class _Handler(BaseHTTPRequestHandler):
             player.play(media_id, s_path, t, s_w, s_h, s_fps,
                         topic, frame_id, tracks, loop, is_video=is_video)
         elif cmd == "scrub":
-            player.action("scrub", t, s_w, s_h, topic, frame_id, is_video=is_video)
+            player.action("scrub", t, s_w, s_h, s_fps, topic,
+                          frame_id, is_video=is_video)
         elif cmd in ("pause", "stop"):
-            player.action(cmd, t, s_w, s_h, topic, frame_id, is_video=is_video)
+            player.action(cmd, t, s_w, s_h, s_fps, topic,
+                          frame_id, is_video=is_video)
         else:
             self._respond(400, {"error": f"unknown cmd: {cmd}"})
             return
