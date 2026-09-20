@@ -1136,6 +1136,7 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
         fps,
         topic: topicRef.current,
         frame_id: frameIdRef.current,
+        loop: loopRef.current,
       }),
     }).catch(() => {})
   }, [id])
@@ -1144,6 +1145,12 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
   // without capturing a stale sendControl closure.
   const sendControlRef = useRef(sendControl)
   sendControlRef.current = sendControl
+
+  // Live mirror of `loop` so sendControl always reports the current loop flag
+  // without re-creating itself on every toggle; also lets the loop toggle
+  // propagate the new value synchronously mid-playback.
+  const loopRef = useRef(loop)
+  loopRef.current = loop
 
   // Preprocess the video into a normalized offline stream (size/fps) so ROS
   // publishing never re-encodes in the live path. Fires on visit (mount) and
@@ -1509,7 +1516,18 @@ function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal: numbe
           <Square size={11} fill="currentColor" />
         </button>
         <button
-          onClick={() => setLoop((l) => !l)}
+          onClick={() => {
+            const next = !loopRef.current
+            setLoop(next)
+            loopRef.current = next
+            // Propagate the new loop flag to a running publish stream so it
+            // loops (or stops looping) at EOF instead of waiting for the next
+            // play command.
+            const v = videoRef.current
+            if (v && !v.paused && !processingRef.current) {
+              sendControlRef.current('play', v.currentTime)
+            }
+          }}
           aria-label={loop ? 'Disable loop' : 'Enable loop'}
           aria-pressed={loop}
           title={loop ? 'Loop on' : 'Loop off'}

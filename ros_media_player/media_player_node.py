@@ -431,6 +431,8 @@ class _Player:
         self._lock = threading.Lock()
         self._playing = False
         self._t = 0.0
+        # Whether Play repeats from the start at EOF (frontend loop button).
+        self._loop = False
         # A playback action ("pause"/"stop"/"scrub") requested while the
         # cursor was still behind its target media-time. It is completed by
         # _on_drain once self._t reaches the target, instead of snapping the
@@ -575,6 +577,14 @@ class _Player:
             self._t += 1.0 / self._fps
             rgba = self._decode_frame(self._t)
             stop = rgba is None  # EOF
+            if stop and self._loop:
+                # Loop: rewind the cursor to the start and carry on instead of
+                # ending the run. Decoding frame 0 re-opens the decoder that
+                # the EOF path released. Skip publishing the duplicated EOF
+                # tick if the rewind decode also fails.
+                self._t = 0.0
+                rgba = self._decode_frame(self._t)
+                stop = rgba is None
         if rgba is not None:
             self._publish_frame(rgba)
         if stop:
@@ -598,7 +608,7 @@ class _Player:
     # -- public API (called from the HTTP server threads) ----------------------
 
     def play(self, media_id, path, t, width, height, fps,
-             topic, frame_id, tracks):
+             topic, frame_id, tracks, loop=False):
         self._stop()
         with self._lock:
             self._media_id = media_id
@@ -611,6 +621,7 @@ class _Player:
             self._frame_id = frame_id
             self._tracks = tracks
             self._playing = True
+            self._loop = bool(loop)
         # Retune the single drain timer to the new frame rate; the next tick
         # decodes from the start point (the first tick seeks the decoder).
         if self._timer is not None:
@@ -1081,6 +1092,7 @@ class _Handler(BaseHTTPRequestHandler):
             fps = 30.0
         topic = payload.get("topic") or "/media_player/image"
         frame_id = payload.get("frame_id") or "media_player"
+        loop = bool(payload.get("loop", False))
 
         timeline = self.backend.get_timeline(media_id) or {}
         tracks = timeline.get("tracks", [])
@@ -1107,7 +1119,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if cmd == "play":
             player.play(media_id, s_path, t, s_w, s_h, s_fps,
-                        topic, frame_id, tracks)
+                        topic, frame_id, tracks, loop)
             self._respond(200, {"ok": True, "cmd": "play", "t": t})
             return
         if cmd == "scrub":
