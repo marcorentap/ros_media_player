@@ -586,8 +586,8 @@ class _Player:
             if reached:
                 self._deferred = None
         if reached:
-            dcmd, dt, dw, dh = deferred
-            self._apply_action(dcmd, dt, dw, dh)
+            dcmd, dt, dw, dh, dtopic, dfid = deferred
+            self._apply_action(dcmd, dt, dw, dh, dtopic, dfid)
 
     def _stop(self) -> None:
         with self._lock:
@@ -616,7 +616,7 @@ class _Player:
         if self._timer is not None:
             self._timer.timer_period_ns = int((1.0 / self._fps) * 1e9)
 
-    def queue_action(self, cmd, t, width, height):
+    def queue_action(self, cmd, t, width, height, topic=None, frame_id=None):
         """Queue a pause/stop/scrub with deferred semantics.
 
         The frontend issues these relative to its own timeline. If a play
@@ -626,17 +626,27 @@ class _Player:
         at/on the far side of ``t`` -- or not streaming at all -- apply it
         immediately. This way the node acts at that point in the media, never
         by snapping forward past frames it hasn't reached yet.
+
+        ``topic``/``frame_id`` (optional) are the configured publish settings
+        to honor when the action applies. They matter most in the *cold* case
+        (no play stream running, e.g. the frontend sending ``stop`` on mount):
+        without them the cursor would fall back to its defaults and publish to
+        the wrong topic. When omitted (None), the current settings are kept.
         """
         with self._lock:
             lagging = self._playing and self._t < t
             if lagging:
-                self._deferred = (cmd, t, width, height)
+                self._deferred = (cmd, t, width, height, topic, frame_id)
                 return
-        self._apply_action(cmd, t, width, height)
+        self._apply_action(cmd, t, width, height, topic, frame_id)
 
-    def _apply_action(self, cmd, t, width=None, height=None):
+    def _apply_action(self, cmd, t, width=None, height=None, topic=None,
+                      frame_id=None):
         """Paused update for pause/stop/scrub: stop the stream and publish the
-        single frame at ``t`` (with the cursor left there)."""
+        single frame at ``t`` (with the cursor left there). The configured
+        ``topic``/``frame_id`` publish settings are applied (defaulting to the
+        current ones when omitted) so a cold stop/scrub that arrives before any
+        play publishes to the user's configured topic, not the default."""
         self._stop()
         rgba = None
         with self._lock:
@@ -645,6 +655,10 @@ class _Player:
                 self._w = int(width)
             if height:
                 self._h = int(height)
+            if topic:
+                self._topic = topic
+            if frame_id:
+                self._frame_id = frame_id
             if self._path:
                 rgba = self._decode_frame(self._t)
         if rgba:
@@ -1100,14 +1114,14 @@ class _Handler(BaseHTTPRequestHandler):
             # Scrub is one-shot and never deferred, and it always pauses the
             # published stream: stop the live stream and publish the single
             # frame at t immediately (it is not resumed afterward).
-            player._apply_action(cmd, t, s_w, s_h)
+            player._apply_action(cmd, t, s_w, s_h, topic, frame_id)
             self._respond(200, {"ok": True, "cmd": cmd, "t": t})
             return
         if cmd in ("pause", "stop"):
             # Deferred semantics: pause/stop take effect at media-time t.
             # If the node's cursor is still behind t (frontend raced ahead),
             # keep streaming and apply only once the cursor reaches it.
-            player.queue_action(cmd, t, s_w, s_h)
+            player.queue_action(cmd, t, s_w, s_h, topic, frame_id)
             self._respond(200, {"ok": True, "cmd": cmd, "t": t})
             return
         self._respond(400, {"error": f"unknown cmd: {cmd}"})
