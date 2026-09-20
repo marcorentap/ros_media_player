@@ -345,27 +345,46 @@ class MediaStore:
         natural_w = probe.get("width", 0)
         natural_h = probe.get("height", 0)
         native_fps = probe.get("fps", 0.0)
-        if not natural_w or not natural_h or not native_fps:
-            self._log("warning",
-                      f"could not probe '{media_id}' for preprocessing")
-            return {"path": base_path, "width": int(width), "height": int(height),
-                    "fps": float(fps), "preprocessed": False}
-        w = int(width or natural_w)
-        h = int(height or natural_h)
-        target_fps = max(1.0, float(fps)) if (fps and fps > 0) else native_fps
-        # Nothing to change: publishing from the original at native size/rate
-        # is already 1:1, so skip the pointless duplicate transcode IF the hot
-        # path can actually decode the source. A file whose codec OpenCV can't
-        # serve (e.g. AV1 on a build with no AV1 decoder) must still be
-        # transcoded, because reusing it would make the player publish nothing.
-        if (w == natural_w and h == natural_h
-                and abs(target_fps - native_fps) < 1e-6):
+
+        # Stream-in-place fast path is only possible with a known natural
+        # size/rate and a requested config that matches it 1:1. It also
+        # requires the OpenCV hot path to actually decode the source: a file
+        # whose codec this build can't serve (e.g. AV1 without a decoder)
+        # would otherwise publish nothing, so such a source must fall through
+        # and be transcoded to H.264 below.
+        if natural_w and natural_h and native_fps:
+            w = int(width or natural_w)
+            h = int(height or natural_h)
+            target_fps = max(1.0, float(fps)) if (fps and fps > 0) else native_fps
+            if (w == natural_w and h == natural_h
+                    and abs(target_fps - native_fps) < 1e-6):
+                if self._source_reusable(base_path):
+                    return {"path": base_path, "width": w, "height": h,
+                            "fps": native_fps, "preprocessed": False}
+                self._log("info",
+                    f"source '{media_id}' not OpenCV-decodable; "
+                    f"transcoding to H.264 at {w}x{h}/{target_fps:.6g} fps")
+        else:
+            # Probe failed, so no natural size/rate is known; the requested
+            # size/fps are the only target (default to 30fps when no rate was
+            # requested). Only skip the transcode when the source itself is
+            # decodable by the hot path -- rare, but a probe miss on a working
+            # codec shouldn't force a redundant re-encode.
+            w = int(width or 0)
+            h = int(height or 0)
+            target_fps = max(1.0, float(fps)) if (fps and fps > 0) else 30.0
             if self._source_reusable(base_path):
-                return {"path": base_path, "width": w, "height": h,
-                        "fps": native_fps, "preprocessed": False}
-            self._log("info",
-                f"source '{media_id}' not OpenCV-decodable; "
-                f"transcoding to H.264 at {w}x{h}/{target_fps:.6g} fps")
+                self._log("info",
+                    f"could not probe '{media_id}' but source decodes "
+                    f"directly; streaming it")
+                return {"path": base_path, "width": int(width),
+                        "height": int(height), "fps": float(fps),
+                        "preprocessed": False}
+            self._log("warning",
+                f"could not probe '{media_id}' and source is not "
+                f"OpenCV-decodable; transcoding to H.264 at "
+                f"{w if w else 'native'}x{h if h else 'native'}/"
+                f"{target_fps:.6g} fps")
 
         key = f"{media_id}__{w}x{h}_{target_fps:.6g}.mp4"
         dst = self.preprocessed(key)
@@ -385,7 +404,8 @@ class MediaStore:
             try:
                 subprocess.run(
                     [ffmpeg, "-y", "-v", "error", "-i", base_path,
-                     "-vf", f"scale={w}:{h},fps={target_fps}",
+                     "-vf", (f"scale={w}:{h},fps={target_fps}"
+                             if (w and h) else f"fps={target_fps}"),
                      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-an",
                      dst],
                     capture_output=True)
