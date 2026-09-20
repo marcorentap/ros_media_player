@@ -954,6 +954,55 @@ class _Handler(BaseHTTPRequestHandler):
             return None
         return payload if isinstance(payload, dict) else None
 
+    def _serve_web(self, path: str, head_only: bool = False) -> None:
+        """Serve the built frontend as an SPA from the resolved web root.
+
+        ``path`` is the URL path (e.g. "/", "/index.html", "/assets/...").
+        Unknown / client-side routes fall back to index.html so deep links and
+        refreshes work without a separate static server.
+        """
+        if not self.b.web_dir:
+            if path in ("", "/"):
+                self._serve_web_hint(head_only)
+            else:
+                self._respond(404, {"error": "web frontend not built"})
+            return
+        if path in ("", "/"):
+            path = "/index.html"
+        rel = path.lstrip("/")
+        full = os.path.normpath(os.path.join(self.b.web_dir, rel))
+        # Guard against path traversal outside the web root.
+        if not (full == self.b.web_dir
+                or full.startswith(self.b.web_dir + os.sep)):
+            self._respond(404, {"error": "not found"})
+            return
+        if not os.path.isfile(full):
+            # SPA fallback: anything that isn't a real file or an API route
+            # serves index.html.
+            full = os.path.join(self.b.web_dir, "index.html")
+        if not os.path.isfile(full):
+            self._respond(404, {"error": "not found"})
+            return
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        self._serve_file(full, ctype, head_only)
+
+    def _serve_web_hint(self, head_only: bool = False) -> None:
+        """Serve a short HTML page explaining how to build the frontend."""
+        body = ("<!doctype html><meta charset=utf-8><title>ros_media_player</title>"
+                "<body style='font-family:system-ui;max-width:52ch;margin:4rem auto;"
+                "line-height:1.5'><h1>ros_media_player</h1>"
+                "<p>The JSON/API backend is running, but no frontend bundle was found.</p>"
+                "<p>Build it with:</p>"
+                "<pre>cd frontend &amp;&amp; pnpm install &amp;&amp; pnpm build</pre>"
+                "<p>then restart the node (or set <code>MEDIA_PLAYER_WEB</code> to a "
+                "directory containing <code>index.html</code>).</p></body>").encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(body)
+
     def _serve_file(self, path: str, ctype: str, head_only: bool = False) -> None:
         """Serve a file with Range support (206 partials for video seeking)."""
         if not path or not os.path.isfile(path):
@@ -1377,14 +1426,15 @@ class _Handler(BaseHTTPRequestHandler):
         elif route.startswith("/media/"):
             self._serve_media(route[len("/media/"):])
         else:
-            self._respond(404, {"error": "not found"})
+            self._serve_web(route)
 
     def do_HEAD(self):
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path.startswith("/media/"):
-            self._serve_media(parsed.path[len("/media/"):], head_only=True)
+        route = parsed.path
+        if route.startswith("/media/"):
+            self._serve_media(route[len("/media/"):], head_only=True)
         else:
-            self._respond(404, {"error": "not found"})
+            self._serve_web(route, head_only=True)
 
     def do_DELETE(self):
         parsed = urllib.parse.urlsplit(self.path)
@@ -1443,9 +1493,45 @@ class Backend:
         self.pub = self.node.create_publisher(String, command_topic, 10)
         self.publisher = Publisher(self.node)
         self.player = Player(self.publisher, self.log)
+        self.web_dir = self._resolve_web_dir()
 
         self.log.info(f"media_player publishing commands on '{command_topic}'")
         self.log.info(f"media_player gallery at '{self.store.media_dir}'")
+        self.log.info(
+            "media_player web frontend "
+            + (f"at '{self.web_dir}'" if self.web_dir
+               else "NOT FOUND (build with `pnpm build` in frontend/, or set $MEDIA_PLAYER_WEB)"))
+
+    @staticmethod
+    def _resolve_web_dir() -> str | None:
+        """Locate the built frontend (dist) to serve, or None if absent.
+
+        Resolution order:
+          1. $MEDIA_PLAYER_WEB  (explicit override)
+          2. the dist colcon installs under share/ros_media_player/web
+          3. frontend/dist next to the source tree
+          4. ./frontend/dist  (relative to the working directory)
+        """
+        env = os.environ.get("MEDIA_PLAYER_WEB")
+        if env:
+            env = os.path.expanduser(env)
+            if os.path.isfile(os.path.join(env, "index.html")):
+                return os.path.abspath(env)
+        try:
+            from ament_index_python.packages import get_package_share_directory
+            cand = os.path.join(get_package_share_directory("ros_media_player"), "web")
+            if os.path.isfile(os.path.join(cand, "index.html")):
+                return os.path.abspath(cand)
+        except Exception:
+            pass
+        here = os.path.dirname(os.path.abspath(__file__))
+        for cand in (os.path.join(here, "..", "frontend", "dist"),
+                     os.path.join(here, "frontend", "dist"),
+                     "frontend/dist"):
+            cand = os.path.abspath(cand)
+            if os.path.isfile(os.path.join(cand, "index.html")):
+                return cand
+        return None
 
     def start(self) -> None:
         """Start the playback thread and serve HTTP until interrupted."""
