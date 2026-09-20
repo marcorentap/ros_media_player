@@ -677,6 +677,12 @@ class Player(threading.Thread):
         self._frame_id = "media_player"
         self._tracks: list = []
         self._loop = False
+        # Media-time before which markers have already been published this
+        # playback pass. The decoded cursor is frame-quantized, but playback
+        # still flows continuously though every real time in between, so
+        # markers are fired on the interval (start, current] reached by this
+        # variable rather than rounded to the nearest frame.
+        self._marker_span_start = 0.0
         # Deferred pause/stop actions waiting for the cursor to reach their
         # media-time while a running stream is still behind it.
         self._pending: list[Action] = []
@@ -723,6 +729,7 @@ class Player(threading.Thread):
             self._end_stream()
             self._decoder = Decoder(self._logger, cmd.path, cmd.is_video,
                                     cmd.width, cmd.height)
+            self._marker_span_start = max(0.0, float(cmd.t))
             self._t = max(0.0, cmd.t)
             self._w = int(cmd.width)
             self._h = int(cmd.height)
@@ -765,23 +772,43 @@ class Player(threading.Thread):
             return None
         return self._decoder.decode(t, self._fps)
 
-    def _points_at(self, t):
-        hits = []
+    def _fire_markers_between(self, start, end):
+        """Publish every marker whose media-time falls in ``(start, end]``.
+
+        The interval advances continuously as playback flows (each tick covers
+        exactly the span the cursor crossed), so a marker placed anywhere
+        between two frames still fires on the tick that crosses it — no
+        frame-quantization of the marker time."""
         for tr in self._tracks:
             for p in tr.get("points") or []:
-                if abs(t - p.get("t", 0)) <= 0.05:
-                    hits.append((tr.get("topic"), tr.get("frameId"),
-                                 tr.get("stamped", True),
-                                 p.get("x", 0.5), p.get("y", 0.5)))
-        return hits
+                pt = p.get("t", 0)
+                if not (start < pt <= end):
+                    continue
+                self._publisher.publish_point(
+                    tr.get("topic") or self._topic,
+                    tr.get("frameId") or self._frame_id,
+                    p.get("x", 0.5), p.get("y", 0.5),
+                    tr.get("stamped", True))
 
-    def _publish_frame(self, rgba: bytes) -> None:
+    def _fire_markers_at(self, t):
+        """Publish markers tied to a discrete pause/stop/scrub landing. A
+        jumped-to media-time rarely lands exactly on a marker's stored
+        timestamp, so accept any marker within half a frame of ``t``."""
+        tol = (0.5 / self._fps) if self._fps else 0.05
+        for tr in self._tracks:
+            for p in tr.get("points") or []:
+                pt = p.get("t", 0)
+                if abs(pt - t) > tol:
+                    continue
+                self._publisher.publish_point(
+                    tr.get("topic") or self._topic,
+                    tr.get("frameId") or self._frame_id,
+                    p.get("x", 0.5), p.get("y", 0.5),
+                    tr.get("stamped", True))
+
+    def _publish_image(self, rgba: bytes) -> None:
         self._publisher.publish_image(
             self._topic, self._frame_id, self._w, self._h, "rgba8", rgba)
-        for topic, fid, stamped, x, y in self._points_at(self._t):
-            self._publisher.publish_point(
-                topic or self._topic, fid or self._frame_id,
-                x, y, stamped)
 
     # -- stream lifecycle (player thread only) ---------------------------------
 
@@ -808,7 +835,11 @@ class Player(threading.Thread):
             self._frame_id = act.frame_id
         rgba = self._decode(self._t) if self._decoder is not None else None
         if rgba:
-            self._publish_frame(rgba)
+            self._publish_image(rgba)
+            self._fire_markers_at(self._t)
+        # Restart marker firing from the landing point, so playback resumed
+        # after this only fires markers whose time lies ahead of the new cursor.
+        self._marker_span_start = self._t
         self._log("info",
             f"{act.cmd.upper()} done: cursor at t={self._t:.3f}s "
             f"published={'yes' if rgba else 'no'}")
@@ -837,6 +868,7 @@ class Player(threading.Thread):
         """One pacing tick of playback: advance the cursor and publish a frame,
         wrapping for loop-EOF and applying any deferred pause/stop the cursor
         has now reached."""
+        span_start = self._marker_span_start
         self._t += 1.0 / self._fps
         rgba = self._decode(self._t)
         if rgba is None:
@@ -845,13 +877,19 @@ class Player(threading.Thread):
                 # EOF with looping on: wrap around and continue from the top.
                 self._t = 0.0
                 rgba = self._decode(self._t)
+                # Fresh pass: markers fire again from the top of the file.
+                span_start = 0.0
             if rgba is None:
                 self._log("info",
                     f"stream reached end at t={self._t:.3f}s "
                     f"({'EOF' if at_eof else 'decode failed'}); stopping")
                 self._end_stream()
                 return
-        self._publish_frame(rgba)
+        self._publish_image(rgba)
+        # Fire every marker the continuously-flowing playhead crossed (or
+        # re-crossed after an EOF wrap) since the last tick.
+        self._fire_markers_between(span_start, self._t)
+        self._marker_span_start = self._t
         while self._pending and self._t >= self._pending[0].t:
             act = self._pending.pop(0)
             self._apply_action(act)
