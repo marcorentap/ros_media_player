@@ -589,7 +589,12 @@ class Decoder:
         can't be produced (EOF, or a codec the platform can't serve)."""
         if not self.is_video:
             return self._still_rgba()
-        frame_no = int(round(t * fps))
+        # Index the frame the browser actually shows at time t: floor(t*fps),
+        # the frame whose presentation time <= t. round() picked the *next*
+        # frame, so a paused/scrubbed publish landed one frame (up to ~1/fps s)
+        # ahead of the frame on screen -- the off-by-one "published frame
+        # doesn't match the scrub position" mismatch.
+        frame_no = max(0, int(t * fps))
         if self.frame_count and frame_no >= self.frame_count:
             return None
         rgba = self._rgba_frame(frame_no)
@@ -870,8 +875,10 @@ class Player(threading.Thread):
     # -- the pacing loop -------------------------------------------------------
 
     def _at_eof(self, t: float) -> bool:
+        # Floor, matching Decoder.decode()'s index, so the boundary where the
+        # last decodable frame ends is identical in both paths.
         return bool(self._decoder is not None and self._decoder.frame_count
-                    and int(round(t * self._fps)) >= self._decoder.frame_count)
+                    and int(t * self._fps) >= self._decoder.frame_count)
 
     def _drain_commands(self) -> bool:
         """Run every queued command now (in FIFO order). Returns True if any."""
