@@ -464,7 +464,11 @@ class Publisher:
 
     def publish_point(self, topic: str, frame_id: str,
                       x: float, y: float, stamped: bool) -> None:
-        """Publish a lane-track point as PointStamped (or bare Point)."""
+        """Publish a lane-track point as PointStamped (or bare Point).
+
+        ``x``/``y`` arrive in image pixel space (top-left origin, scaled by the
+        published stream's width/height in Player._publish_marker), so they map
+        directly onto the accompanying Image frame's cols/rows."""
         now = self.node.get_clock().now().to_msg()
         if stamped:
             pub = self._stamped_pubs.get(topic)
@@ -785,7 +789,7 @@ class Player(threading.Thread):
                     f"{cmd.cmd.upper()} DEFERRED: cursor {self._t:.3f}s still "
                     f"behind t={cmd.t:.3f}s; applying when reached")
         elif isinstance(cmd, Point):
-            self._publisher.publish_point(
+            self._publish_marker(
                 cmd.topic, cmd.frame_id, cmd.x, cmd.y, cmd.stamped)
         elif isinstance(cmd, Shutdown):
             pass
@@ -797,6 +801,23 @@ class Player(threading.Thread):
         if self._decoder is None:
             return None
         return self._decoder.decode(t, self._fps)
+
+    def _publish_marker(self, topic, frame_id, x, y, stamped) -> None:
+        """Publish one marker in image pixel space.
+
+        The frontend stores marker x/y as normalized image coordinates (0..1
+        over the actual rendered content, letterbox-free). Here they are
+        scaled by the published stream's width/height so ROS subscribers
+        receive pixel coordinates in the accompanying Image frame, not unit
+        fractions. origin is the image's top-left, matching how the Image rows
+        are laid out, so ``point`` lands on the pixel the user clicked. When
+        the stream shape hasn't been resolved yet (self._w/_h are 0, e.g. a
+        marker saved before any play/scrub), the normalized values are passed
+        through untouched rather than collapsing to (0,0)."""
+        w, h = self._w, self._h
+        if w > 0 and h > 0:
+            x, y = float(x) * w, float(y) * h
+        self._publisher.publish_point(topic, frame_id, float(x), float(y), stamped)
 
     def _fire_markers_between(self, start, end):
         """Publish every marker whose media-time falls in ``(start, end]``.
@@ -810,7 +831,7 @@ class Player(threading.Thread):
                 pt = p.get("t", 0)
                 if not (start < pt <= end):
                     continue
-                self._publisher.publish_point(
+                self._publish_marker(
                     tr.get("topic") or self._topic,
                     tr.get("frameId") or self._frame_id,
                     p.get("x", 0.5), p.get("y", 0.5),
@@ -826,7 +847,7 @@ class Player(threading.Thread):
                 pt = p.get("t", 0)
                 if abs(pt - t) > tol:
                     continue
-                self._publisher.publish_point(
+                self._publish_marker(
                     tr.get("topic") or self._topic,
                     tr.get("frameId") or self._frame_id,
                     p.get("x", 0.5), p.get("y", 0.5),

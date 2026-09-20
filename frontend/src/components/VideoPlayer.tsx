@@ -7,7 +7,8 @@ import {
   sendControl,
 } from '../api'
 import type { TimelinePoint, TimelineTrack } from '../types'
-import { formatTime, clamp01 } from '../lib/format'
+import { formatTime } from '../lib/format'
+import { elementToImage, imageToElement } from '../lib/contain'
 import { DEFAULT_TRACKS, trackColor } from '../lib/tracks'
 import { useLatest } from '../lib/hooks'
 import { Timeline } from './Timeline'
@@ -359,13 +360,22 @@ export function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal
   }, [tracks, selectedKey, saveTimeline])
 
   // Clicking the video drops a marker on the selected track at playhead time,
-  // remembering where on the frame the click landed.
+  // remembering where on the frame the click landed. The stored x/y are
+  // normalized to the actual rendered image content (letterbox-free, via
+  // elementToImage) so they stay valid across publish-resolution changes; the
+  // backend scales them to pixel space when it publishes the ROS point.
   const onVideoClick = useCallback(
     (e: ReactMouseEvent<HTMLVideoElement>) => {
       if (!tracks || !selectedKey) return
-      const rect = e.currentTarget.getBoundingClientRect()
-      const x = rect.width > 0 ? clamp01((e.clientX - rect.left) / rect.width) : 0
-      const y = rect.height > 0 ? clamp01((e.clientY - rect.top) / rect.height) : 0
+      const v = e.currentTarget
+      const rect = v.getBoundingClientRect()
+      const elW = rect.width
+      const elH = rect.height
+      const vw = v.videoWidth || preResRef.current.width || 0
+      const vh = v.videoHeight || preResRef.current.height || 0
+      const ex = elW > 0 ? (e.clientX - rect.left) / elW : 0
+      const ey = elH > 0 ? (e.clientY - rect.top) / elH : 0
+      const { x, y } = elementToImage(ex, ey, elW, elH, vw, vh)
       addMarker(selectedKey, { t: current, x, y })
     },
     [tracks, selectedKey, current, addMarker],
@@ -564,24 +574,37 @@ export function VideoPlayer({ id, deselectSignal }: { id: string; deselectSignal
           </div>
         )}
         {/* overlay dots flashing on the video as the playhead passes each marker; clicking one removes it */}
-        {(tracks ?? [])
-          .flatMap((t) =>
-            t.points
-              .filter((p) => Math.abs(current - p.t) <= 0.05)
-              .map((p) => ({ point: p, trackKey: t.key, color: t.color })),
-          )
-          .map((m, i) => (
-            <div
-              key={m.point.t + ':' + m.point.x + ':' + m.point.y + ':' + i}
-              title="Remove marker"
-              className="pointer-events-auto absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full ring-2 ring-black/60 transition-transform hover:scale-125 hover:brightness-125"
-              style={{ left: `${m.point.x * 100}%`, top: `${m.point.y * 100}%`, background: m.color }}
-              onClick={(e) => {
-                e.stopPropagation()
-                removeMarker(m.trackKey, m.point)
-              }}
-            />
-          ))}
+        {(() => {
+          // Map stored image-normalized coords back onto the letterboxed element
+          // so dots sit exactly where the click landed on the rendered image.
+          const v = videoRef.current
+          const rect = v ? v.getBoundingClientRect() : null
+          const elW = rect?.width ?? 0
+          const elH = rect?.height ?? 0
+          const vw = v?.videoWidth || preResRef.current.width || 0
+          const vh = v?.videoHeight || preResRef.current.height || 0
+          return (tracks ?? [])
+            .flatMap((t) =>
+              t.points
+                .filter((p) => Math.abs(current - p.t) <= 0.05)
+                .map((p) => ({ point: p, trackKey: t.key, color: t.color })),
+            )
+            .map((m, i) => {
+              const el = imageToElement(m.point.x, m.point.y, elW, elH, vw, vh)
+              return (
+                <div
+                  key={m.point.t + ':' + m.point.x + ':' + m.point.y + ':' + i}
+                  title="Remove marker"
+                  className="pointer-events-auto absolute h-3 w-3 -translate-x-1/2 -translate-y-1/2 cursor-crosshair rounded-full ring-2 ring-black/60 transition-transform hover:scale-125 hover:brightness-125"
+                  style={{ left: `${el.x * 100}%`, top: `${el.y * 100}%`, background: m.color }}
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    removeMarker(m.trackKey, m.point)
+                  }}
+                />
+              )
+            })
+        })()}
       </div>
 
       <div className="mx-auto mt-2 flex w-full max-w-[747px] items-center justify-between gap-2.5">
